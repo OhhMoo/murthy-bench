@@ -169,3 +169,41 @@ slash command doesn't crash the loop; `SystemExit` (from `/exit`) is re-raised.
 - `devlog.md` (this file)
 
 ---
+
+## 2026-05-23 — Slash command autocomplete (prompt_toolkit)
+
+### Motivation
+
+Users had no discoverability for slash commands — you had to already know `/help` existed to
+find the command list. Wanted: type `/` and see all available commands immediately, Tab to
+cycle and select.
+
+### Implementation
+
+Replaced `input()` with `prompt_toolkit.PromptSession`. Added a `SlashCompleter(Completer)`
+subclass: `get_completions` only fires when the input starts with `/`, matches against an
+`_SLASH_META` list of `(command, description)` pairs, and yields `Completion` objects with
+`display_meta` set to the description string. The completion dropdown appears the moment `/`
+is typed; Tab cycles forward, Shift+Tab cycles backward.
+
+Styled the completion menu to match the bamboo palette using `PTStyle.from_dict`:
+- Menu background: `#152108` (dark bamboo)
+- Menu text: `#c3df6e` (bamboo yellow-green)
+- Selected row: `#3d6018` bg / `#eaf5a0` text
+
+The `PromptSession` is created once before the loop and reused across turns (preserves
+session-level history for free via `InMemoryHistory` default).
+
+The `input()` → `PromptSession` change also fixes the Windows prompt-not-visible regression
+from the previous entry: `prompt_toolkit` handles its own ANSI rendering independently of
+Rich's console state.
+
+### Dependency added
+- `prompt_toolkit>=3.0.0` → `requirements.txt`
+
+### Files modified
+- `benchmark/chat.py`: added `_SLASH_META`, `_PT_STYLE`, `SlashCompleter`; updated `run_chat`
+- `requirements.txt`: added `prompt_toolkit>=3.0.0`
+- `devlog.md` (this file)
+
+---

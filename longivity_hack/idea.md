@@ -14,53 +14,60 @@ This captures a failure mode that final-answer-only metrics miss entirely: a mod
 
 For numerical tasks (age prediction, lifespan, fold change, drug extension %), the model does not submit a single number. It submits an **interval [min, max]**.
 
-An interval is **good** if it contains the correct answer. But a wide interval is penalized. The score for a single task across K rounds is:
+An interval is **good** if it contains the correct answer. But a wide interval is penalized. The **session-level** score across N problems is:
 
 ```
-score = (10 + Σ floor(max/min) for good intervals) × 2^(rounds_missed)
+score = (10 + Σ floor(max/min) for GOOD final answers) × 2^(N − # good final answers)
 ```
 
 - Lower score is better
+- Only the **last** submission per problem counts — refining a good interval is a bet
 - A correct but wide interval [1, 200] scores worse than a tight correct interval [58, 72]
-- A wrong interval doubles the penalty
-- This forces the model to be both **calibrated** (contains the truth) and **confident** (narrow interval)
+- An unsolved problem doubles the score — covering all N problems beats nailing one perfectly
+- This forces the model to be both **calibrated** (interval contains the truth) and **confident** (narrow interval)
 
-The model can resubmit a refined interval each round after receiving feedback. This directly tests whether the model can reason about its own uncertainty and update it.
+The model can resubmit a refined interval after each slip. This directly tests whether the model can reason about its own uncertainty and update it using only biological domain knowledge.
 
-### 2. Partial Feedback (Yes/No Budget)
+### 2. Partial Feedback (Binary, Shared Budget)
 
-After each submission, the model receives structured feedback:
+After each submission the model receives **only binary feedback** — no directional hints:
 
-| Task type | Feedback signal |
+| Signal | Meaning |
 |---|---|
-| Numerical | "Your interval does not contain the answer" / "Correct, but your interval spans factor X" |
-| Binary / MCQ | "Correct" / "Wrong" |
-| Set generation | "N of your K genes are correct" (no hint which ones) |
-| Ternary | "Correct" / "Wrong direction" / "No effect is not the answer" |
+| `GOOD` | Interval contains the correct answer |
+| `BAD`  | Interval does not contain the correct answer |
 
-**Budget constraint**: Each model run gets a fixed total number of feedback tokens (e.g., 18 signals across 13 tasks — directly borrowed from Estimathon's 18 slips / 13 problems ratio). The model must decide how to allocate: spend more rounds refining a hard task, or lock in an answer early and move on.
+No "too high / too low." The model must use its biological domain knowledge to infer *why* it missed and in which direction to move. Directional hints would let the model converge mechanically without any reasoning — binary-only feedback forces genuine understanding.
+
+After each slip the model also sees:
+- Its current score (before → after, with ↓/↑)
+- A live standings table for every problem
+- Remaining slips in the shared budget
+- A warning if it replaced a previously GOOD interval with a BAD one
+
+**Shared budget**: One pool of slips across all N problems (default `floor(1.38 × N)`, matching the real Estimathon's 18-slip / 13-problem ratio). The model must decide how to allocate: spend more slips refining a hard problem, or lock in an answer early and move on.
 
 ---
 
 ## What We Measure
 
-For each task instance:
+Per session:
 
 | Metric | Description |
 |---|---|
-| `rounds_to_correct` | How many feedback rounds before the model's submission is correct |
-| `final_interval_score` | `floor(max/min)` of the last submitted interval (lower = more confident) |
-| `convergence_trajectory` | Sequence of interval widths across rounds — does it narrow monotonically? |
-| `budget_efficiency` | Did the model waste submissions on a task it had already solved? |
-| `thinking_trace` | Full `<think>` block at each round — recorded for reasoning analysis |
+| `final_score` | `(10 + Σ floor(max/min) for GOOD final answers) × 2^(N − # good)` — lower is better |
+| `n_good_final` | Problems solved at session end |
+| `slips_used` | Total submissions made |
+| `refinement_accuracy` | Of bets placed on improving a GOOD interval, fraction that succeeded |
+| `thinking_trace` | Full `<think>` block per slip — recorded for reasoning analysis |
 
-Aggregate across all tasks:
+**Refinement accuracy** is the primary inference quality signal. After a confirmed GOOD interval, any re-submission is a voluntary bet. Random guessing on binary-only feedback succeeds ~50% of the time. A model significantly above 50% is genuinely reasoning about biology to infer the direction of refinement; a model at 50% is guessing.
 
 ```
-total_score = (10 + Σ floor(max/min) for all good final intervals) × 2^(# tasks with no correct submission)
+total_score = (10 + Σ floor(max/min) for all GOOD final intervals) × 2^(N − # good final answers)
 ```
 
-Lower total score = better. A model that hedges with wide intervals will lose to a model that is genuinely calibrated, even if both get the same number of tasks "correct."
+Lower total score = better. A model that hedges with wide intervals will lose to a model that is genuinely calibrated, even if both solve the same number of problems.
 
 ---
 
@@ -78,22 +85,23 @@ Lower total score = better. A model that hedges with wide intervals will lose to
 
 ## Example Walkthrough
 
-**Task**: Predict the chronological age of a subject from 353 CpG methylation beta values (regression task, ground truth = 67 years).
+**Task**: Predict the chronological age of a subject from 353 CpG methylation beta values (ground truth = 67 years). 8 problems total, shared budget of 11 slips.
 
-**Round 1**
-- Model submits: `[40, 90]` — interval width = floor(90/40) = 2
-- Feedback: "Your interval contains the answer. Width factor: 2."
+**Slip 1** — Problem: CpG age
+- Model submits: `[40, 90]` — width factor = floor(90/40) = 2
+- Feedback: `GOOD`  width=2.  Score 1024 → 522 ↓.  Slips remaining: 10.
 
-**Round 2**
-- Model's thinking trace: *"The interval is valid but wide. The methylation pattern at cg07364285 suggests an older subject, probably above 60. I'll narrow to [60, 80]."*
-- Model submits: `[60, 80]` — width = floor(80/60) = 1
-- Feedback: "Your interval contains the answer. Width factor: 1."
+**Slip 2** — Model bets on tightening the interval
+- Thinking trace: *"GOOD means 67 is inside [40, 90]. The methylation pattern at cg07364285 skews older — most subjects with this profile are 60–75. I'll bet on [60, 80]."*
+- Model submits: `[60, 80]` — width factor = floor(80/60) = 1
+- Feedback: `GOOD`  width=1.  Score 522 → 270 ↓.  Slips remaining: 9.
 
-**Round 3**
-- Model's thinking trace: *"Width factor 1 means floor(max/min) = 1, so max < 2×min. I'm already tight. I'll lock this in and use remaining budget elsewhere."*
-- Model does not resubmit. Final score contribution: 1 (good interval, width factor 1).
+**Slip 3** — Model moves on to another problem
+- Thinking trace: *"Width factor 1 is as tight as I can go without risking a miss. Expected value of refining further is negative. Using remaining slips on unsolved problems."*
 
-**Contrast with a poorly calibrated model**: submits `[1, 120]` every round, always "correct" but width = floor(120/1) = 120. Scores 120 per task vs. 1.
+**Refinement accuracy signal**: the model placed 1 bet (slip 2) and succeeded. A model that bets randomly after binary-only feedback wins ~50%; this model used its biological reasoning to infer direction correctly.
+
+**Contrast with a poorly calibrated model**: submits `[1, 120]` every round — always GOOD, but width factor = 120 per problem. Same "correct" count, 60× worse score.
 
 ---
 
@@ -143,8 +151,11 @@ Minimum 50 instances per task. Budget fixed at 5 rounds per task (or shared pool
 
 | Component | Formula | Direction |
 |---|---|---|
-| Per-task interval score | `floor(max/min)` of final good interval | Lower better |
-| Miss penalty | `× 2` per task with no correct submission | Lower better |
-| Total | `(10 + Σ width_factors) × 2^misses` | Lower better |
-| Budget efficiency | Rounds used / rounds available | Lower better |
-| Convergence rate | Rounds to first correct interval | Lower better |
+| Width factor per problem | `floor(max/min)` of last GOOD interval | Lower better |
+| Unsolved penalty | `2^(N − # good final answers)` multiplier | Lower better |
+| Session score | `(10 + Σ width_factors) × unsolved_penalty` | Lower better |
+| Refinement accuracy | Fraction of voluntary bets on GOOD intervals that succeeded | Higher better |
+| Budget used | `slips_used / total_budget` | Lower better |
+
+**Default budget**: `floor(1.38 × N)` slips for N problems (e.g. 10 slips for 7 problems).  
+**Baseline**: a random-interval agent achieves ~50% refinement accuracy and high width factors — any well-calibrated model should beat both.
