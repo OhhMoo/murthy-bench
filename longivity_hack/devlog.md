@@ -170,6 +170,67 @@ slash command doesn't crash the loop; `SystemExit` (from `/exit`) is re-raised.
 
 ---
 
+## 2026-05-23 — InSilico LongeBench → Estimathon Adapter
+
+### Motivation
+
+LongeBench (`insilicomedicine/longebench`) contains 32K+ tasks across 6 formats: binary, multiclass,
+ternary, pairwise, regression, and generation. Our estimathon runner is designed for numeric
+interval-based tasks — the gold value must be extractable as a float, and user prompts must ask
+for interval submissions.
+
+The raw LongeBench rows couldn't work in estimathon mode because:
+1. Assistant messages contain reasoning traces (sometimes multi-paragraph), not bare numbers
+2. Prompts ask for single answers, not intervals
+3. Non-regression formats (binary, MCQ, etc.) have categorical gold values — incompatible with
+   interval scoring formula
+
+### Solution: Transformation layer in `loader.py`
+
+**Constants added:**
+- `ESTIMATHON_COMPATIBLE_FORMATS = {"regression", "pairwise"}` — only these formats have
+  numeric gold values
+- `_INTERVAL_INSTRUCTION` — standard suffix appended to user prompts
+
+**New functions:**
+- `_extract_lb_gold(content)` — robust numeric extractor. Tries direct `float()` first, then
+  regex search for the last number in the text. Handles "67 years", multi-line reasoning traces,
+  and scientific notation.
+- `_transform_lb_to_estimathon(task)` — filters by format, extracts numeric gold, rewrites
+  user prompt to request intervals, converts gold to bare float. Returns None if incompatible.
+
+**API change:**
+- `load_tasks(source, limit, estimathon=False)` — new parameter. When `estimathon=True` and
+  source is `longebench*`, applies transformation and filters incompatible tasks.
+- Return type changed from `Iterator[dict]` to `list[dict]` (already used as list in cli.py).
+
+**Filtering strategy:**
+From the 32K total LongeBench tasks, only regression/pairwise tasks survive. These are the
+biological age prediction, biomarker prediction, and similar numeric estimation tasks — a
+natural subset of the benchmark. Non-numeric tasks (binary classification, multiclass, etc.)
+are silently dropped.
+
+### CLI integration
+
+In `cli.py`:
+- `run` command passes `estimathon=(mode == EvalMode.estimathon)` to `load_tasks()`
+- Added a status line when loading from longebench in estimathon mode:
+  `"Filtered to regression-compatible tasks (interval format)"`
+
+### Backward compatibility
+
+- One-shot mode still loads raw LongeBench rows (`estimathon=False`)
+- Sample tasks completely unaffected
+- Existing local JSONL files can opt-in to transformation by passing `estimathon=True`
+
+### Testing needed
+
+1. `python cli.py tasks --tasks longebench --limit 10` — verify interval prompts in output
+2. `python cli.py run --model claude-haiku-... --provider anthropic --tasks longebench --mode estimathon --limit 5` — full session test
+3. Check `results.jsonl` to confirm `format: "interval"` and clean numeric golds in slip_log
+
+---
+
 ## 2026-05-23 — Mixed eval mode + /setup wizard + LongeBench token fix
 
 ### Problem: non-numerical LongeBench tasks had nowhere to go
