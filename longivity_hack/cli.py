@@ -98,12 +98,20 @@ def run(
     )
 
     try:
-        task_list = list(load_tasks(tasks, limit=limit))
+        task_list = load_tasks(
+            tasks,
+            limit=limit,
+            estimathon=(mode == EvalMode.estimathon),
+        )
     except (FileNotFoundError, ImportError) as exc:
         console.print(f"[red]Error loading tasks:[/red] {exc}")
         raise typer.Exit(1)
 
     console.print(f"Loaded [bold]{len(task_list)}[/bold] tasks.")
+    if mode == EvalMode.estimathon and tasks.startswith("longebench"):
+        console.print(
+            "[cyan]Note:[/cyan] Filtered to regression-compatible tasks (interval format)"
+        )
 
     with ResultWriter(str(output)) as writer:
 

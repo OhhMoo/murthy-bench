@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from typing import Iterator
 
@@ -187,33 +188,119 @@ _SAMPLE_TASKS = [
 
 
 # ---------------------------------------------------------------------------
+# LongeBench → Estimathon transformation
+# ---------------------------------------------------------------------------
+
+ESTIMATHON_COMPATIBLE_FORMATS = {"regression", "pairwise"}
+
+_INTERVAL_INSTRUCTION = (
+    "\n\nSubmit an interval [min, max] for your answer. "
+    "Reply with only: [min, max]"
+)
+
+
+def _extract_lb_gold(assistant_content: str) -> float | None:
+    """Extract numeric gold value from LongeBench assistant message.
+
+    Handles bare numbers ('67'), units ('67 years'), and multi-line reasoning traces.
+    Returns the last numeric value found, or None if parsing fails.
+    """
+    content = assistant_content.strip()
+
+    # Try direct float first
+    try:
+        return float(content)
+    except ValueError:
+        pass
+
+    # Find all numbers and take the last one
+    nums = re.findall(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", content)
+    if nums:
+        try:
+            return float(nums[-1])
+        except ValueError:
+            pass
+
+    return None
+
+
+def _transform_lb_to_estimathon(task: dict) -> dict | None:
+    """Convert a raw LongeBench row to estimathon format.
+
+    Filters by format, extracts numeric gold from assistant message,
+    and rewrites user prompt to request interval [min, max] answers.
+    Returns None if incompatible (non-numeric format or unparseable gold).
+    """
+    if task.get("format") not in ESTIMATHON_COMPATIBLE_FORMATS:
+        return None
+
+    messages = task.get("messages", [])
+    if not messages or messages[-1].get("role") != "assistant":
+        return None
+
+    gold_val = _extract_lb_gold(messages[-1]["content"])
+    if gold_val is None:
+        return None
+
+    # Rewrite messages: strip assistant turn, append interval instruction to user turn
+    new_messages = []
+    for msg in messages[:-1]:  # drop gold assistant turn
+        if msg["role"] == "user":
+            # Remove any existing "respond with only" instruction, then append interval instruction
+            content = re.sub(
+                r"\n*Respond with only.*$", "", msg["content"], flags=re.DOTALL
+            ).rstrip()
+            content += _INTERVAL_INSTRUCTION
+            new_messages.append({"role": msg["role"], "content": content})
+        else:
+            new_messages.append(msg)
+
+    # Re-append gold as bare number (what _extract_gold in runner.py expects)
+    new_messages.append({"role": "assistant", "content": str(gold_val)})
+
+    return {
+        **task,
+        "messages": new_messages,
+        "format": "interval",
+        "metric": "estimathon_score",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public loader
 # ---------------------------------------------------------------------------
 
-def load_tasks(source: str, limit: int | None = None) -> Iterator[dict]:
+def load_tasks(
+    source: str, limit: int | None = None, estimathon: bool = False
+) -> list[dict]:
     """
-    Yield task dicts from:
+    Load task dicts from:
       "sample"           — built-in tasks, no network required
       "longebench"       — HuggingFace insilicomedicine/longebench benchmark split
       "longebench:extra" — HuggingFace longebench extra split
       <path>             — local .jsonl file
+
+    If estimathon=True and source is longebench, filters to regression-compatible tasks
+    and rewrites prompts to request interval [min, max] answers.
     """
     if source == "sample":
-        yield from _load_sample(limit)
+        return _load_sample(limit, estimathon)
     elif source.startswith("longebench"):
-        yield from _load_longebench(source, limit)
+        return _load_longebench(source, limit, estimathon)
     else:
-        yield from _load_jsonl(source, limit)
+        return _load_jsonl(source, limit, estimathon)
 
 
-def _load_sample(limit: int | None) -> Iterator[dict]:
+def _load_sample(limit: int | None, estimathon: bool) -> list[dict]:
     tasks = _SAMPLE_TASKS
     if limit is not None:
         tasks = tasks[:limit]
-    yield from tasks
+    return tasks
 
 
-def _load_longebench(source: str, limit: int | None) -> Iterator[dict]:
+def _load_longebench(
+    source: str, limit: int | None, estimathon: bool
+) -> list[dict]:
     try:
         from datasets import load_dataset
     except ImportError:
@@ -222,19 +309,28 @@ def _load_longebench(source: str, limit: int | None) -> Iterator[dict]:
     config_name = "extra" if source == "longebench:extra" else "benchmark"
     ds = load_dataset("insilicomedicine/longebench", config_name, split="eval")
 
+    tasks = []
     count = 0
     for row in ds:
         if limit is not None and count >= limit:
             break
-        yield dict(row)
+        task = dict(row)
+        if estimathon:
+            task = _transform_lb_to_estimathon(task)
+            if task is None:
+                continue  # skip incompatible tasks
+        tasks.append(task)
         count += 1
 
+    return tasks
 
-def _load_jsonl(path: str, limit: int | None) -> Iterator[dict]:
+
+def _load_jsonl(path: str, limit: int | None, estimathon: bool) -> list[dict]:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Tasks file not found: {path}")
 
+    tasks = []
     count = 0
     with p.open() as f:
         for line in f:
@@ -243,5 +339,12 @@ def _load_jsonl(path: str, limit: int | None) -> Iterator[dict]:
             line = line.strip()
             if not line:
                 continue
-            yield json.loads(line)
+            task = json.loads(line)
+            if estimathon:
+                task = _transform_lb_to_estimathon(task)
+                if task is None:
+                    continue
+            tasks.append(task)
             count += 1
+
+    return tasks
