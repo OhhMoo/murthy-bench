@@ -237,6 +237,42 @@ A model with high trace quality but low refinement accuracy is a red flag worth 
 
 ---
 
+## Model Discovery & Selection
+
+Use `model_selector.py` to browse 300+ open-source LLMs from HuggingFace:
+
+```bash
+# List top 20 models by downloads
+python model_selector.py list
+
+# Search for specific models (e.g., Llama)
+python model_selector.py search llama
+
+# Show details of a model
+python model_selector.py info 6
+
+# Generate CLI command for a model
+python model_selector.py cmd 6
+```
+
+**Update model database** (requires HF_TOKEN):
+```bash
+HF_TOKEN=hf_xxxxx python fetch_models.py 500 hf_llm_models.csv
+```
+
+This creates `hf_llm_models.csv` with:
+- model_id, author, downloads, likes
+- HuggingFace URL and inference API endpoint
+- Tags and gating status
+
+You can then use the generated commands to benchmark any model:
+```bash
+python cli.py run --model Llama-3.1-8B-Instruct --provider hf \
+  --tasks sample --mode estimathon --limit 7
+```
+
+---
+
 ## Adding a new eval mode
 
 1. Add `my_mode = "my-mode"` to `EvalMode` in `cli.py`
