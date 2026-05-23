@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from pathlib import Path
 from typing import Iterator
@@ -271,7 +272,10 @@ def _transform_lb_to_estimathon(task: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def load_tasks(
-    source: str, limit: int | None = None, estimathon: bool = False
+    source: str,
+    limit: int | None = None,
+    estimathon: bool = False,
+    mixed: bool = False,
 ) -> list[dict]:
     """
     Load task dicts from:
@@ -280,19 +284,19 @@ def load_tasks(
       "longebench:extra" — HuggingFace longebench extra split
       <path>             — local .jsonl file
 
-    If estimathon=True and source is longebench, filters to regression-compatible tasks
-    and rewrites prompts to request interval [min, max] answers.
-    Local JSONL files are not transformed (assumed already estimathon-ready if needed).
+    estimathon=True  — numerical tasks only, prompts rewritten to request [min, max]
+    mixed=True       — all tasks; numerical ones are rewritten, categorical kept as-is
+    (both False)     — all tasks, no transformation
     """
     if source == "sample":
-        return _load_sample(limit, estimathon)
+        return _load_sample(limit)
     elif source.startswith("longebench"):
-        return _load_longebench(source, limit, estimathon)
+        return _load_longebench(source, limit, estimathon=estimathon, mixed=mixed)
     else:
-        return _load_jsonl(source, limit, estimathon)
+        return _load_jsonl(source, limit)
 
 
-def _load_sample(limit: int | None, estimathon: bool) -> list[dict]:
+def _load_sample(limit: int | None) -> list[dict]:
     tasks = _SAMPLE_TASKS
     if limit is not None:
         tasks = tasks[:limit]
@@ -300,15 +304,17 @@ def _load_sample(limit: int | None, estimathon: bool) -> list[dict]:
 
 
 def _load_longebench(
-    source: str, limit: int | None, estimathon: bool
+    source: str, limit: int | None, estimathon: bool, mixed: bool
 ) -> list[dict]:
     try:
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Run: pip install datasets")
 
+    from . import config as cfg
+    token = cfg.get("hf.token") or os.environ.get("HF_TOKEN")
     config_name = "extra" if source == "longebench:extra" else "benchmark"
-    ds = load_dataset("insilicomedicine/longebench", config_name, split="eval")
+    ds = load_dataset("insilicomedicine/longebench", config_name, split="eval", token=token)
 
     tasks = []
     count = 0
@@ -316,17 +322,26 @@ def _load_longebench(
         if limit is not None and count >= limit:
             break
         task = dict(row)
+
         if estimathon:
+            # numerical only — skip tasks that can't be transformed
             task = _transform_lb_to_estimathon(task)
             if task is None:
-                continue  # skip incompatible tasks
+                continue
+        elif mixed:
+            # transform numerical tasks in-place; keep categorical tasks raw
+            transformed = _transform_lb_to_estimathon(task)
+            if transformed is not None:
+                task = transformed
+            # else: keep original categorical task as-is
+
         tasks.append(task)
         count += 1
 
     return tasks
 
 
-def _load_jsonl(path: str, limit: int | None, estimathon: bool) -> list[dict]:
+def _load_jsonl(path: str, limit: int | None) -> list[dict]:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Tasks file not found: {path}")
@@ -340,9 +355,7 @@ def _load_jsonl(path: str, limit: int | None, estimathon: bool) -> list[dict]:
             line = line.strip()
             if not line:
                 continue
-            task = json.loads(line)
-            # Note: estimathon flag is ignored for local files (assumed already correct format)
-            tasks.append(task)
+            tasks.append(json.loads(line))
             count += 1
 
     return tasks

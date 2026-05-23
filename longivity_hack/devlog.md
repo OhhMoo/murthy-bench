@@ -170,6 +170,77 @@ slash command doesn't crash the loop; `SystemExit` (from `/exit`) is re-raised.
 
 ---
 
+## 2026-05-23 — Mixed eval mode + /setup wizard + LongeBench token fix
+
+### Problem: non-numerical LongeBench tasks had nowhere to go
+
+LongeBench contains 6 task formats: regression, pairwise, binary, multiclass, ternary,
+generation. The Estimathon mechanic (interval [min, max], shared budget, binary feedback)
+only makes sense for numerical tasks — you can't submit an interval for "yes or no".
+Previously `--mode estimathon` silently dropped all non-numerical tasks.
+
+### Solution: two-track hybrid (`--mode mixed`)
+
+Split by `format` field, run each pile through the right pipeline:
+
+| Track | Formats | Eval function | Scoring |
+|---|---|---|---|
+| Estimathon | regression, pairwise, interval | `run_estimathon()` | Estimathon score |
+| One-shot | binary, multiclass, ternary, generation | `run_eval()` | Accuracy / F1 |
+
+`_ESTIMATHON_FORMATS = {"regression", "pairwise", "interval"}` is the canonical routing set.
+
+For generation tasks (gene lists), added token F1 scoring in `_score_task()`: splits pred
+and gold on whitespace/commas, computes precision/recall/F1, marks `correct=True` if F1≥0.5.
+Binary/multiclass/ternary use exact-match (case-insensitive).
+
+### How the evaluated model knows which mode it's in
+
+Three layers signal the answer type to the model being tested:
+
+1. **System prompt** — Estimathon tasks are presented inside a session with a full game-rules
+   system prompt ("You have N slips, submit PROBLEM X / INTERVAL [min, max], binary feedback").
+   One-shot tasks have no such context.
+
+2. **Task prompt rewrite** — `_transform_lb_to_estimathon()` appends
+   "Submit an interval [min, max] for your answer. Reply with only: [min, max]"
+   to numerical tasks. Categorical tasks keep their original prompt unchanged.
+
+3. **Separate conversations** — The Estimathon session is one long multi-turn conversation
+   (all numerical problems at once). Each categorical task is an independent single-turn call.
+   The model never needs to decide which mode it's in.
+
+### Loader changes
+
+Added `mixed=False` parameter to `load_tasks()`. When `mixed=True`:
+- Numerical tasks → `_transform_lb_to_estimathon()` → interval format + float gold
+- Categorical tasks → pass through unchanged
+- Both returned in the same list; `run_mixed()` splits them by `format`
+
+Also fixed a bug: `_load_longebench()` was not passing the HuggingFace token to
+`load_dataset()`. Gated datasets require `token=` to be passed explicitly. Fixed by reading
+`cfg.get("hf.token")` or `os.environ.get("HF_TOKEN")`.
+
+### /setup wizard
+
+Added `_setup_wizard()` triggered by `/setup` slash command. Three-step interactive wizard:
+1. Anthropic API key (password-masked input via `PromptSession(is_password=True)`)
+2. HuggingFace token — saved to config, then immediately verified by connecting to
+   `insilicomedicine/longebench` with `streaming=True` and fetching one row
+3. OpenAI API key (optional, skippable)
+
+If LongeBench access fails, the wizard prints the dataset URL and tells the user to request
+access before re-running `/setup`.
+
+### Files modified
+- `benchmark/runner.py`: `_ESTIMATHON_FORMATS`, `_score_task()`, updated `_run_one_shot()`, `run_mixed()`
+- `benchmark/loader.py`: `mixed=False` param, HF token fix in `_load_longebench()`
+- `benchmark/chat.py`: `_setup_wizard()`, `/setup` in `_SLASH_META` + `_handle_slash` + help panel, `run_mixed` import
+- `cli.py`: `EvalMode.mixed`, mixed dispatch block with two summary panels
+- `devlog.md` (this file), `README.md`, `CLAUDE.md`
+
+---
+
 ## 2026-05-23 — Slash command autocomplete (prompt_toolkit)
 
 ### Motivation

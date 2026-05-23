@@ -26,7 +26,7 @@ from . import config as cfg
 from .client import ModelClient
 from .loader import load_tasks
 from .results import ResultWriter
-from .runner import run_estimathon, run_eval
+from .runner import run_estimathon, run_eval, run_mixed
 
 console = Console()
 
@@ -62,6 +62,7 @@ _TAGLINE = "Longevity LLM Benchmark  ·  Estimathon-style evaluation"
 
 _SLASH_META = [
     ("/help",         "Show all commands"),
+    ("/setup",        "Configure API keys and HuggingFace dataset access"),
     ("/exit",         "Exit the chat"),
     ("/clear",        "Clear conversation history"),
     ("/model",        "Show or set benchmark model"),
@@ -149,7 +150,7 @@ _TOOLS = [
     },
     {
         "name": "run_benchmark",
-        "description": "Run a benchmark session (estimathon or one-shot) against a model.",
+        "description": "Run a benchmark session against a model. Use mode='mixed' for LongeBench (handles both numerical and categorical tasks automatically).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -158,7 +159,7 @@ _TOOLS = [
                 "api_key":      {"type": "string"},
                 "endpoint_url": {"type": "string"},
                 "tasks_source": {"type": "string"},
-                "mode":         {"type": "string", "enum": ["estimathon", "one-shot"]},
+                "mode":         {"type": "string", "enum": ["estimathon", "one-shot", "mixed"]},
                 "budget":       {"type": "integer"},
                 "limit":        {"type": "integer"},
                 "think":        {"type": "boolean"},
@@ -241,7 +242,11 @@ def _tool_run_benchmark(
     if isinstance(client, str):
         return client
     try:
-        task_list = load_tasks(tasks_source, limit=limit, estimathon=(mode == "estimathon"))
+        task_list = load_tasks(
+            tasks_source, limit=limit,
+            estimathon=(mode == "estimathon"),
+            mixed=(mode == "mixed"),
+        )
     except Exception as exc:
         return f"Error loading tasks: {exc}"
     if not task_list:
@@ -253,27 +258,57 @@ def _tool_run_benchmark(
         f"[green]Mode:[/green] {mode}   "
         f"[green]Tasks:[/green] {len(task_list)}   "
         f"[green]Think:[/green] {think}",
-        border_style="green", expand=False,
+        border_style="rgb(100,145,55)", expand=False,
     ))
-    if mode == "estimathon" and tasks_source.startswith("longebench"):
-        console.print("  [dim green]Filtered to regression-compatible tasks (interval format)[/dim green]")
+
+    def _slip_line(r: dict) -> None:
+        good = r.get("good", False)
+        wf   = r.get("width_factor")
+        bar  = "█" * min(wf or 0, 20) if good else "░" * 10
+        console.print(
+            f"  [dim]#{r['slip']:02d}[/dim]  "
+            f"[cyan]{r['pid']:<18}[/cyan]  "
+            f"[{'green' if good else 'red'}]{'GOOD' if good else 'BAD '}[/]"
+            + (f"  [green]{bar}[/green] w={wf}" if good else f"  [red]{bar}[/red]")
+            + f"  [dim]{r['score_before']} → {r['score_after']}[/dim]"
+            + (" [yellow]⚠ lost good[/yellow]" if r.get("prev_was_good") and not good else "")
+        )
+
+    def _result_line(r: dict) -> None:
+        ok = r.get("correct", False)
+        console.print(
+            f"  [{'green' if ok else 'red'}]{'✓' if ok else '✗'}[/]  "
+            f"[cyan]{r.get('lb_id',''):<18}[/cyan]  "
+            f"[dim]{r.get('format',''):<12}[/dim]  "
+            f"gold=[dim]{str(r.get('gold',''))[:10]}[/dim]  "
+            f"pred=[dim]{str(r.get('pred',''))[:20]}[/dim]"
+        )
 
     with ResultWriter(output) as writer:
-        if mode == "estimathon":
-            def on_slip(r: dict):
-                good = r.get("good", False)
-                wf   = r.get("width_factor")
-                bar  = "█" * min(wf or 0, 20) if good else "░" * 10
-                console.print(
-                    f"  [dim]#{r['slip']:02d}[/dim]  "
-                    f"[cyan]{r['pid']:<18}[/cyan]  "
-                    f"[{'green' if good else 'red'}]{'GOOD' if good else 'BAD '}[/]"
-                    + (f"  [green]{bar}[/green] w={wf}" if good else f"  [red]{bar}[/red]")
-                    + f"  [dim]{r['score_before']} → {r['score_after']}[/dim]"
-                    + (" [yellow]⚠ lost good[/yellow]" if r.get("prev_was_good") and not good else "")
+        if mode == "mixed":
+            result = run_mixed(
+                tasks=task_list, client=client,
+                total_budget=budget, enable_thinking=think,
+                on_slip=_slip_line, on_result=_result_line,
+            )
+            writer.write(result)
+            parts = []
+            if result.get("estimathon"):
+                er = result["estimathon"]
+                ref_acc = er.get("refinement_accuracy")
+                parts.append(
+                    f"Estimathon: score={er['final_score']}  "
+                    f"solved={er['n_good_final']}/{er['n_problems']}  "
+                    f"ref_acc={f'{ref_acc:.0%}' if ref_acc is not None else 'n/a'}"
                 )
+            if result.get("one_shot"):
+                os_r = result["one_shot"]
+                parts.append(f"One-shot: {os_r['n_correct']}/{os_r['n_tasks']} ({os_r['accuracy']:.0%})")
+            summary = "  |  ".join(parts) if parts else "no results"
+
+        elif mode == "estimathon":
             result = run_estimathon(tasks=task_list, client=client,
-                                    total_budget=budget, enable_thinking=think, on_slip=on_slip)
+                                    total_budget=budget, enable_thinking=think, on_slip=_slip_line)
             writer.write(result)
             ref_acc = result.get("refinement_accuracy")
             ref_str = f"{ref_acc:.0%}" if ref_acc is not None else "n/a"
@@ -288,20 +323,14 @@ def _tool_run_benchmark(
             def on_result(r: dict):
                 records.append(r)
                 writer.write(r)
-                ok = r.get("correct", False)
-                console.print(
-                    f"  [{'green' if ok else 'red'}]{'✓' if ok else '✗'}[/]  "
-                    f"[cyan]{r.get('lb_id',''):<18}[/cyan]  "
-                    f"gold=[dim]{str(r.get('gold',''))[:10]}[/dim]  "
-                    f"pred=[dim]{str(r.get('pred',''))[:20]}[/dim]"
-                )
+                _result_line(r)
             run_eval(tasks=iter(task_list), client=client, enable_thinking=think, on_result=on_result)
             n = len(records)
             correct = sum(1 for r in records if r.get("correct"))
             summary = f"{correct}/{n} correct ({correct/n:.0%})" if n else "0 results"
 
-    console.print(Rule(style="green"))
-    console.print(f"  [bold green]Done.[/bold green]  {summary}  [dim]→ {output}[/dim]")
+    console.print(Rule(style="rgb(100,145,55)"))
+    console.print(f"  [bold rgb(160,200,80)]Done.[/bold rgb(160,200,80)]  {summary}  [dim]→ {output}[/dim]")
     return summary
 
 
@@ -316,6 +345,115 @@ def _execute_tool(name: str, inputs: dict) -> str:
     return f"Unknown tool: {name}"
 
 # ---------------------------------------------------------------------------
+# Setup wizard
+# ---------------------------------------------------------------------------
+
+def _setup_wizard() -> None:
+    """Interactive wizard for configuring API keys and verifying HuggingFace access."""
+
+    def _masked(val: str | None) -> str:
+        if not val:
+            return "[dim]not set[/dim]"
+        if len(val) > 8:
+            return f"[dim]{val[:4]}…{val[-4:]}[/dim]"
+        return "[dim]set[/dim]"
+
+    def _ask(label: str, hint: str = "") -> str:
+        """Prompt with password masking. Returns stripped input."""
+        if hint:
+            console.print(f"    [dim]{hint}[/dim]")
+        console.print(f"    [rgb(160,200,80)]Paste value or press Enter to keep current:[/rgb(160,200,80)]")
+        wizard_session = PromptSession(style=_PT_STYLE)
+        return wizard_session.prompt("    > ", is_password=True).strip()
+
+    console.print()
+    console.print(Panel(
+        "[bold]API key & dataset setup wizard[/bold]\n"
+        "Keys are saved to [cyan]~/.longevity/config.json[/cyan]\n"
+        "Press [dim]Enter[/dim] on any step to keep the existing value and move on.",
+        title="[rgb(195,225,100)]  MURPHY SETUP  [/rgb(195,225,100)]",
+        border_style="rgb(100,145,55)",
+        expand=False,
+    ))
+
+    # ── Step 1: Anthropic ────────────────────────────────────────────────────
+    console.print()
+    console.print("[bold rgb(160,200,80)][1/3][/bold rgb(160,200,80)]  Anthropic API key")
+    console.print(f"    Used for: Claude chat + [cyan]--provider anthropic[/cyan] benchmarks")
+    console.print(f"    Current:  {_masked(cfg.get('anthropic.api_key'))}")
+    val = _ask("Starts with sk-ant-…")
+    if val:
+        cfg.set_value("anthropic.api_key", val)
+        console.print("    [green]✓[/green] Saved.")
+    else:
+        console.print("    [dim]→ unchanged[/dim]")
+
+    # ── Step 2: HuggingFace token ────────────────────────────────────────────
+    console.print()
+    console.print("[bold rgb(160,200,80)][2/3][/bold rgb(160,200,80)]  HuggingFace token")
+    console.print(f"    Used for: LongeBench dataset + [cyan]--provider hf[/cyan] model inference")
+    console.print(f"    Get one at [cyan]huggingface.co/settings/tokens[/cyan]")
+    console.print(f"    Current:  {_masked(cfg.get('hf.token'))}")
+    val = _ask("Starts with hf_…")
+    if val:
+        cfg.set_value("hf.token", val)
+        console.print("    [green]✓[/green] Saved.")
+
+    # Verify LongeBench access
+    hf_token = cfg.get("hf.token")
+    if hf_token:
+        console.print()
+        console.print("    [dim]Verifying LongeBench access…[/dim]")
+        console.print(
+            "    [dim]If you haven't already, request access at:[/dim]\n"
+            "    [cyan]huggingface.co/datasets/insilicomedicine/longebench[/cyan]"
+        )
+        try:
+            import os
+            from datasets import load_dataset
+            ds = load_dataset(
+                "insilicomedicine/longebench", "benchmark",
+                split="eval", streaming=True,
+                token=hf_token,
+            )
+            row = next(iter(ds))
+            domain = row.get("domain", "?")
+            console.print(f"    [green]✓[/green] Access confirmed  [dim](first row domain: {domain})[/dim]")
+        except StopIteration:
+            console.print("    [green]✓[/green] Dataset connected (empty split)")
+        except Exception as exc:
+            short = str(exc)[:100]
+            console.print(f"    [red]✗[/red] Failed: {short}")
+            console.print(
+                "    [yellow]→[/yellow] Make sure you accepted the access form on the dataset page,\n"
+                "       then re-run [green]/setup[/green] to re-test."
+            )
+    else:
+        console.print("    [dim]→ no token, skipping LongeBench verification[/dim]")
+
+    # ── Step 3: OpenAI (optional) ────────────────────────────────────────────
+    console.print()
+    console.print("[bold rgb(160,200,80)][3/3][/bold rgb(160,200,80)]  OpenAI API key  [dim](optional)[/dim]")
+    console.print(f"    Current:  {_masked(cfg.get('openai.api_key'))}")
+    val = _ask("Starts with sk-… — press Enter to skip")
+    if val:
+        cfg.set_value("openai.api_key", val)
+        console.print("    [green]✓[/green] Saved.")
+    else:
+        console.print("    [dim]→ skipped[/dim]")
+
+    # ── Done ─────────────────────────────────────────────────────────────────
+    console.print()
+    console.print(Panel(
+        "[green]✓[/green] Setup complete.\n"
+        "Run [green]/config[/green] to review all stored values.\n"
+        "Run [green]/status[/green] to test model connectivity.",
+        border_style="rgb(100,145,55)",
+        expand=False,
+    ))
+
+
+# ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
 
@@ -326,6 +464,7 @@ def _help_panel() -> None:
     table.add_column("desc",  style="white")
     rows = [
         ("/help",         "",                        "Show this help"),
+        ("/setup",        "",                        "Configure API keys + verify HuggingFace access"),
         ("/exit",         "",                        "Exit the chat"),
         ("/clear",        "",                        "Clear conversation history"),
         ("/model",        "[bench-model]",           "Show or set default benchmark model"),
@@ -348,6 +487,10 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
 
     if cmd == "/help":
         _help_panel()
+        return True
+
+    if cmd == "/setup":
+        _setup_wizard()
         return True
 
     if cmd == "/exit":

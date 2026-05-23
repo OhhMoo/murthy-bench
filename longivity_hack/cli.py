@@ -27,7 +27,7 @@ from benchmark.chat import run_chat
 from benchmark.client import ModelClient
 from benchmark.loader import load_tasks
 from benchmark.results import ResultWriter
-from benchmark.runner import run_eval, run_estimathon
+from benchmark.runner import run_eval, run_estimathon, run_mixed
 
 app = typer.Typer(
     name="longevity",
@@ -48,8 +48,9 @@ class Provider(str, Enum):
 
 
 class EvalMode(str, Enum):
-    one_shot = "one-shot"
+    one_shot   = "one-shot"
     estimathon = "estimathon"
+    mixed      = "mixed"
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +64,7 @@ def run(
     api_key: Optional[str] = typer.Option(None, "--api-key", "-k", help="API key (overrides config/env)"),
     endpoint: Optional[str] = typer.Option(None, "--endpoint", "-e", help="Custom base URL (for provider=endpoint)"),
     tasks: str = typer.Option("longebench", "--tasks", "-t", help='"longebench", "longebench:extra", or path to .jsonl'),
-    mode: EvalMode = typer.Option(EvalMode.one_shot, "--mode", help="one-shot | estimathon"),
+    mode: EvalMode = typer.Option(EvalMode.one_shot, "--mode", help="one-shot | estimathon | mixed"),
     output: Path = typer.Option(Path("results.jsonl"), "--output", "-o", help="Output file path"),
     concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=8, help="Parallel requests for one-shot (max 8)"),
     budget: Optional[int] = typer.Option(None, "--budget", "-b", help="Total slips for estimathon (default: auto ~1.38×N)"),
@@ -103,6 +104,7 @@ def run(
             tasks,
             limit=limit,
             estimathon=(mode == EvalMode.estimathon),
+            mixed=(mode == EvalMode.mixed),
         )
     except (FileNotFoundError, ImportError) as exc:
         console.print(f"[red]Error loading tasks:[/red] {exc}")
@@ -111,6 +113,11 @@ def run(
     console.print(f"Loaded [bold]{len(task_list)}[/bold] tasks.")
     if mode == EvalMode.estimathon and tasks.startswith("longebench"):
         console.print("  [dim]Filtered to regression-compatible tasks (interval format)[/dim]")
+    if mode == EvalMode.mixed:
+        from benchmark.runner import _ESTIMATHON_FORMATS
+        n_num = sum(1 for t in task_list if t.get("format") in _ESTIMATHON_FORMATS)
+        n_cat = len(task_list) - n_num
+        console.print(f"  [dim]Track 1 (Estimathon): {n_num} numerical  ·  Track 2 (one-shot): {n_cat} categorical[/dim]")
 
     with ResultWriter(str(output)) as writer:
 
@@ -159,6 +166,81 @@ def run(
                     expand=False,
                 )
             )
+
+        # ------------------------------------------------------------------
+        # Mixed mode — Estimathon for numerical, one-shot for categorical
+        # ------------------------------------------------------------------
+        elif mode == EvalMode.mixed:
+            def on_slip_mixed(record: dict):
+                good = record.get("good", False)
+                wf   = record.get("width_factor")
+                sb, sa = record["score_before"], record["score_after"]
+                direction = "↓" if sa < sb else ("↑" if sa > sb else "=")
+                console.print(
+                    f"  [dim]Slip {record['slip']:2d}[/dim]  "
+                    f"[cyan]{record['pid']}[/cyan]  "
+                    f"[{'green' if good else 'red'}]{'GOOD' if good else 'BAD '}[/]"
+                    + (f"  width={wf}" if wf is not None else "")
+                    + f"  score {sb} {direction} {sa}"
+                    + ("  [yellow]⚠ lost good[/yellow]" if record.get("prev_was_good") and not good else "")
+                )
+
+            cat_table = Table(show_lines=False)
+            cat_table.add_column("lb_id",  style="cyan", no_wrap=True)
+            cat_table.add_column("format", style="dim")
+            cat_table.add_column("gold",   justify="right")
+            cat_table.add_column("pred",   justify="right")
+            cat_table.add_column("",       justify="center")
+
+            def on_result_mixed(record: dict):
+                writer.write(record)
+                correct = record.get("correct", False)
+                cat_table.add_row(
+                    record.get("lb_id", ""),
+                    record.get("format", ""),
+                    str(record.get("gold", ""))[:12],
+                    (record.get("pred") or "")[:20],
+                    "[green]✓[/green]" if correct else "[red]✗[/red]",
+                )
+
+            mixed_result = run_mixed(
+                tasks=task_list,
+                client=client,
+                total_budget=budget,
+                concurrency=concurrency,
+                enable_thinking=think,
+                on_slip=on_slip_mixed,
+                on_result=on_result_mixed,
+            )
+            writer.write(mixed_result)
+
+            # --- Estimathon summary ---
+            if mixed_result.get("estimathon"):
+                er = mixed_result["estimathon"]
+                ref_acc = er.get("refinement_accuracy")
+                ref_str = f"{ref_acc:.0%}" if ref_acc is not None else "n/a"
+                console.print(Panel(
+                    f"[bold]Track 1 — Estimathon[/bold]  ({mixed_result['n_numerical']} numerical tasks)\n"
+                    f"Final score:  [bold]{er['final_score']}[/bold]  (lower is better)\n"
+                    f"Problems solved:  {er['n_good_final']} / {er['n_problems']}\n"
+                    f"Slips used:  {er['slips_used']} / {er['total_budget']}\n"
+                    f"Refinement accuracy:  {ref_str}",
+                    title="[bold]Estimathon Summary[/bold]", expand=False,
+                ))
+
+            # --- One-shot summary ---
+            if mixed_result.get("one_shot"):
+                os_r = mixed_result["one_shot"]
+                console.print(cat_table)
+                fmt_lines = ""
+                for fmt, stats in sorted(os_r["by_format"].items()):
+                    fmt_lines += f"  {fmt:<14}  {stats['correct']:>3}/{stats['n']:<3}  ({stats['accuracy']:.0%})\n"
+                console.print(Panel(
+                    f"[bold]Track 2 — One-shot[/bold]  ({mixed_result['n_categorical']} categorical tasks)\n"
+                    + fmt_lines.rstrip()
+                    + f"\n  {'Overall':<14}  {os_r['n_correct']:>3}/{os_r['n_tasks']:<3}  ({os_r['accuracy']:.0%})",
+                    title="[bold]One-shot Summary[/bold]", expand=False,
+                ))
 
         # ------------------------------------------------------------------
         # One-shot mode — parallel, one request per task

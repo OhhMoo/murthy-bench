@@ -1,278 +1,271 @@
-# Longevity Hackathon — Team Research Guide
+# Murphy — Developer Guide
 
-## What We're Building
-
-An iterative refinement benchmark for Longevity-LLM (L-LLM), a fine-tuned Qwen3.5-9B model for aging biology. Instead of one-shot Q&A, we give the model interval-based numerical tasks, feed it yes/no correctness signals after each attempt, and measure how fast and efficiently it converges to the right answer. Read `idea.md` for the full concept before diving into your area.
+Longevity LLM benchmark CLI (Track 01 · Insilico Medicine Hackathon).
+Read `idea.md` for the benchmark design rationale. This file is for contributors extending the code.
 
 **L-LLM endpoint:** `https://saujlffcxf20v74m.us-east-2.aws.endpoints.huggingface.cloud`
-**Dataset:** `insilicomedicine/longebench` on HuggingFace (gated — request access if you haven't)
-**Submission format:** JSONL files in ChatML system-user-assistant format
+**Dataset:** `insilicomedicine/longebench` on HuggingFace (gated — request access first)
 
 ---
 
-## How the Three Areas Connect
+## Current state
+
+The CLI is fully built. All three original hackathon areas map as follows:
+
+| Area | Status | Notes |
+|---|---|---|
+| Area 1 — Custom dataset | **TODO** | See below — need AnAge/DrugAge tasks.jsonl |
+| Area 2 — Eval loop | **Done** | `benchmark/runner.py` + `cli.py` |
+| Area 3 — Trace scorer | **TODO** | See below — scorer.py not yet written |
+
+---
+
+## Quick start
+
+```bash
+cd longivity_hack
+pip install -r requirements.txt
+python cli.py          # opens interactive chat
+```
+
+In chat, run `/setup` to configure API keys and verify LongeBench access.
+
+To run a benchmark directly:
+```bash
+python cli.py run --model claude-sonnet-4-6 --provider anthropic --tasks longebench --mode mixed --limit 50
+```
+
+---
+
+## Codebase map
 
 ```
-Area 1: Dataset         Area 2: Eval Loop        Area 3: Trace Scorer
-─────────────────       ─────────────────────    ────────────────────
-Build interval tasks  → Run L-LLM iteratively  → Score thinking traces
-Output: tasks.jsonl     Output: results.jsonl    Output: scorer + report
+benchmark/
+├── config.py     Config at ~/.longevity/config.json; env vars override
+├── client.py     ModelClient — wraps all providers behind one .chat() interface
+├── loader.py     load_tasks() — sample / LongeBench (with token) / local JSONL
+├── runner.py     run_estimathon(), run_eval(), run_mixed(), scoring helpers
+├── results.py    ResultWriter / read_results — JSONL append
+└── chat.py       Interactive chat UI — Claude tool-use, /setup, slash autocomplete
+cli.py            Typer app — run / chat / status / tasks / config commands
 ```
 
-Area 2 depends on Area 1's output. Area 3 depends on Area 2's output. Start Area 1 first, then Area 2 can begin as soon as the first 50 tasks are ready. Area 3 can prototype independently using existing LongeBench thinking traces.
-
 ---
 
-## Area 1 — Dataset Construction
+## Key design decisions
 
-**Goal:** Build a set of interval-based benchmark tasks grounded in real aging biology data. Minimum 50 task instances, leakage-free train/test split, verifiable ground truth.
+### Scoring formula
+```
+score = (10 + Σ floor(max/min) for GOOD final answers) × 2^(N − # good final answers)
+```
+Lower is better. Only the **last** submission per problem counts.
+Default budget: `floor(1.38 × N)` slips, matching the real Estimathon's 18/13 ratio.
 
-### Your job
+### Binary-only feedback
+The model receives GOOD or BAD — **no directional hints** ("too high / too low").
+Directional hints let a model converge by bracket-searching without any biological understanding.
+Binary-only forces genuine domain reasoning. The original CLAUDE.md had directional hints — that
+version was wrong. Do not reintroduce them.
 
-1. **Pick two source datasets** from the list below and download them. Aim for ones not already in LongeBench (NHANES, GTEx, GEO are already used — pick something fresher for retrieval resistance).
+### Refinement accuracy
+After a GOOD interval is confirmed, any re-submission is a voluntary bet.
+`refinement_accuracy = successes / attempts`. Random guessing wins ~50%.
+A model above 50% is reasoning about biology to infer direction; at 50% it is guessing.
+This is the primary signal for comparing L-LLM vs baselines.
 
-   | Dataset | URL | Best for |
-   |---|---|---|
-   | AnAge | genomics.senescence.info/download | Multispecies lifespan regression |
-   | DrugAge | genomics.senescence.info/download | Drug lifespan extension % regression |
-   | MGI mouse phenotypes | informatics.jax.org/downloads | Mutation effect on murine lifespan |
-   | GEO (pick obscure GSE) | ncbi.nlm.nih.gov/geo | DNAm-based age regression |
+### Two-track evaluation (mixed mode)
+LongeBench has 6 task formats. Only regression and pairwise have numeric gold values suitable
+for interval scoring. Mixed mode routes by the `format` field:
 
-2. **Design the task prompt.** The user message should contain a real biological profile (a row of measurements), and the model should respond with an interval [min, max]. Example for AnAge:
-
-   ```
-   System: You are an expert in comparative biology and aging.
-   User: Given the following biological traits of an unknown mammal species:
-     - Body mass: 22.4 kg
-     - Metabolic rate: 0.38 W/kg
-     - Gestation time: 290 days
-     - Litter size: 1.2
-   Submit an interval [min, max] for the maximum lifespan of this species in years.
-   Respond with only: [min, max]
-   ```
-
-3. **Build the leakage-free split.** Split by a covariate that prevents data leakage:
-   - AnAge → split by taxonomic Order
-   - DrugAge → split by drug mechanism class
-   - GEO → split by GSE accession
-   - MGI → split by genetic background strain
-
-4. **Output format.** Each task instance as a JSONL row:
-   ```json
-   {
-     "lb_id": "LB-ITER-001",
-     "task": "multispecies_lifespan_regression",
-     "domain": "comparative_biology",
-     "format": "interval",
-     "metric": "estimathon_score",
-     "budget": 5,
-     "messages": [
-       {"role": "system", "content": "..."},
-       {"role": "user", "content": "...biological profile..."},
-       {"role": "assistant", "content": "[20, 60]"}
-     ],
-     "gold": 45.2,
-     "split": "test"
-   }
-   ```
-   The final assistant message is the gold answer range hint — Area 2 will strip this and run the actual iterative loop.
-
-### Deliverable
-`tasks.jsonl` — at least 50 test instances, plus train/val splits. Include a short `data_notes.md` describing the source, split rationale, and any preprocessing decisions.
-
----
-
-## Area 2 — Evaluation Loop
-
-**Goal:** Implement the iterative feedback protocol, run L-LLM against Area 1's tasks, and collect full multi-round records including thinking traces.
-
-### Your job
-
-1. **Set up the client.** Install dependencies and verify endpoint access:
-   ```bash
-   pip install openai datasets
-   ```
-   ```python
-   from openai import OpenAI
-   client = OpenAI(
-       base_url="https://saujlffcxf20v74m.us-east-2.aws.endpoints.huggingface.cloud/v1",
-       api_key="<token>",
-   )
-   ```
-
-2. **Implement the feedback loop.** For each task instance:
-   - Send the prompt to L-LLM (with thinking enabled)
-   - Parse the model's interval response `[min, max]`
-   - Check if the gold answer falls within the interval
-   - Generate the feedback message (see feedback rules below)
-   - Append feedback to conversation history and repeat
-   - Stop when: budget exhausted, or model submits a correct interval with width factor ≤ 2
-
-   **Feedback rules:**
-   ```python
-   def generate_feedback(pred_min, pred_max, gold, attempt, budget):
-       contains = pred_min <= gold <= pred_max
-       width_factor = int(pred_max / pred_min)
-       if contains:
-           return f"Your interval contains the answer. Width factor: {width_factor}. {budget - attempt} submissions remaining."
-       else:
-           direction = "too high" if pred_min > gold else "too low"
-           return f"Your interval does not contain the answer — it is {direction}. {budget - attempt} submissions remaining."
-   ```
-
-3. **Parse interval responses.** Models don't always format cleanly:
-   ```python
-   import re
-   def parse_interval(text):
-       m = re.search(r'\[?\s*([0-9.e+\-]+)\s*,\s*([0-9.e+\-]+)\s*\]?', text)
-       if m:
-           return float(m.group(1)), float(m.group(2))
-       return None, None
-   ```
-
-4. **Extract thinking traces.** Strip `<think>` blocks before scoring but save them:
-   ```python
-   def split_think(raw):
-       m = re.search(r'<think>(.*?)</think>\s*', raw, flags=re.DOTALL)
-       if m:
-           return m.group(1).strip(), raw[m.end():].strip()
-       return None, raw.strip()
-   ```
-
-5. **Concurrency.** Max 8 parallel requests to the shared endpoint. Use `ThreadPoolExecutor(max_workers=8)`.
-
-6. **Output format.** One JSONL record per task instance with full conversation history:
-   ```json
-   {
-     "lb_id": "LB-ITER-001",
-     "gold": 45.2,
-     "budget": 5,
-     "rounds": [
-       {
-         "round": 1,
-         "think": "The metabolic rate suggests...",
-         "answer": "[20, 60]",
-         "pred_min": 20, "pred_max": 60,
-         "contains_gold": true,
-         "width_factor": 3,
-         "feedback": "Correct. Width factor: 3. 4 submissions remaining."
-       },
-       {
-         "round": 2,
-         "think": "I can narrow this...",
-         "answer": "[35, 55]",
-         "pred_min": 35, "pred_max": 55,
-         "contains_gold": true,
-         "width_factor": 1,
-         "feedback": "Correct. Width factor: 1. 3 submissions remaining."
-       }
-     ],
-     "rounds_to_correct": 1,
-     "final_width_factor": 1,
-     "task_score": 1,
-     "budget_used": 2
-   }
-   ```
-
-### Deliverable
-`results.jsonl` — full multi-round records for all test instances. Include a `eval_notes.md` with any parsing edge cases, timeout issues, or anomalies observed.
-
----
-
-## Area 3 — Reasoning Trace Scorer
-
-**Goal:** Build a programmatic scoring function that evaluates the *quality of reasoning* in the thinking traces collected by Area 2. The scorer must be automatable, hard to hack, and correlated with biological correctness.
-
-### Your job
-
-You can prototype independently using existing LongeBench traces while waiting for Area 2 results. To get traces quickly:
 ```python
-from datasets import load_dataset
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="https://saujlffcxf20v74m.us-east-2.aws.endpoints.huggingface.cloud/v1",
-    api_key="<token>",
-)
-ds = load_dataset("insilicomedicine/longebench", "benchmark", split="eval")
-# pick a small subset, run with enable_thinking=True, collect raw traces
+_ESTIMATHON_FORMATS = {"regression", "pairwise", "interval"}
+# tasks with these formats → run_estimathon()
+# all other formats → run_eval() with format-aware scoring
 ```
 
-### Three scoring signals to implement
+Generation tasks (gene lists) use token F1 ≥ 0.5 as the correctness threshold.
+Binary / multiclass / ternary use exact-match (case-insensitive).
+
+### How the model knows which mode it's in
+Three layers — the model never has to guess:
+1. **Estimathon system prompt** explicitly states game rules (budget, PROBLEM N / INTERVAL format)
+2. **Task prompt** for numerical tasks has the interval instruction appended by `_transform_lb_to_estimathon()`
+3. **Separate conversations** — Estimathon is one long multi-turn session; one-shot tasks are independent calls
+
+---
+
+## Provider wiring
+
+All providers go through `benchmark/client.py`. HuggingFace and custom endpoints use the
+OpenAI SDK with `base_url` overridden. Anthropic uses the `anthropic` SDK directly.
+
+| Provider | SDK | base_url |
+|---|---|---|
+| `anthropic` | `anthropic.Anthropic` | n/a |
+| `openai` | `openai.OpenAI` | default |
+| `hf` | `openai.OpenAI` | `https://api-inference.huggingface.co/models/{id}/v1` |
+| `endpoint` | `openai.OpenAI` | user-supplied URL |
+
+To connect to L-LLM:
+```bash
+python cli.py status \
+  --model longevity-llm \
+  --provider endpoint \
+  --endpoint https://saujlffcxf20v74m.us-east-2.aws.endpoints.huggingface.cloud \
+  --api-key <hf-token>
+```
+
+---
+
+## Area 1 — Custom dataset (TODO)
+
+Build interval-based tasks from aging biology sources not already in LongeBench.
+NHANES, GTEx, GEO are already in LongeBench — avoid them (hurts retrieval resistance score).
+
+**Recommended sources:**
+
+| Dataset | URL | Task type |
+|---|---|---|
+| AnAge | genomics.senescence.info/download | Multispecies lifespan regression |
+| DrugAge | genomics.senescence.info/download | Drug lifespan extension % regression |
+| MGI mouse phenotypes | informatics.jax.org/downloads | Mutation → murine lifespan |
+
+**Task format** (JSONL, one row per instance):
+```json
+{
+  "lb_id": "LB-CUSTOM-001",
+  "task": "multispecies_lifespan_regression",
+  "domain": "comparative_biology",
+  "format": "regression",
+  "metric": "estimathon_score",
+  "messages": [
+    {"role": "system", "content": "You are an expert in comparative biology and aging science."},
+    {"role": "user",   "content": "Given the following biological profile...\n\nSubmit an interval [min, max] for the maximum lifespan of this species in years.\nReply with only: [min, max]"},
+    {"role": "assistant", "content": "45.2"}
+  ]
+}
+```
+The last assistant message is the **bare numeric gold value** (no units, no brackets).
+`runner.py` extracts it with `float(messages[-1]["content"].strip())`.
+
+**Split strategy** — prevent data leakage:
+- AnAge → split by taxonomic Order
+- DrugAge → split by drug mechanism class
+- MGI → split by genetic background strain
+
+**Deliverable:** `tasks.jsonl` (≥50 test instances) + `data_notes.md`.
+Load with: `python cli.py tasks --tasks path/to/tasks.jsonl`
+
+---
+
+## Area 3 — Reasoning trace scorer (TODO)
+
+A programmatic scorer that evaluates the *quality of reasoning* in `<think>` traces collected
+during `--think` runs. Scorer must be automatable and correlated with biological correctness.
+
+**Input:** `results.jsonl` from `--mode estimathon --think`
+**Output:** `scored_traces.jsonl` — one record per slip with added quality scores
+
+### Three signals to implement
 
 **Signal 1 — Entity verification**
-
-Extract biological entities from the thinking trace and verify they exist:
+Extract biological entities from the think trace and check them against authoritative lists:
 ```python
-# Gene symbols: check against HGNC or a local gene list
-# CpG site IDs: check against Illumina 450K/EPIC manifest
-# Drug names: check against DrugAge/DrugBank
-
-def verify_entities(think_trace, entity_type="gene"):
-    # extract candidates
-    # lookup against authoritative list
-    # return: (n_mentioned, n_valid, n_hallucinated)
+# Gene symbols → HGNC list
+# CpG site IDs → Illumina 450K/EPIC manifest
+# Drug names → DrugAge / DrugBank
+def entity_hallucination_rate(think_trace: str) -> float:
+    # returns fraction of mentioned entities that don't exist
     pass
 ```
 
-**Signal 2 — Monotonic convergence check**
-
-Across rounds, does the model's interval narrow consistently?
+**Signal 2 — Monotonic convergence**
+For each problem, does the width factor decrease monotonically across GOOD submissions?
 ```python
-def convergence_score(rounds):
-    widths = [r["width_factor"] for r in rounds if r["contains_gold"]]
+def convergence_score(slip_log: list[dict]) -> float:
+    good_slips = [s for s in slip_log if s["good"]]
+    widths = [s["width_factor"] for s in good_slips if s["width_factor"] is not None]
     if len(widths) < 2:
         return 1.0
-    # penalize if width ever increases after being correct
     violations = sum(widths[i] > widths[i-1] for i in range(1, len(widths)))
     return 1.0 - violations / (len(widths) - 1)
 ```
 
 **Signal 3 — Trace-answer consistency**
-
-Does the model's stated reasoning in the think block predict the interval it actually submits?
+Does the reasoning in the think block predict the interval actually submitted?
+Use Claude Haiku as a judge (cheap, one call per slip):
 ```python
-# If the think trace says "this species likely lives 40-50 years"
-# but the submitted interval is [10, 200], that's inconsistent
-# Use an LLM judge (cheapest Claude model) to score consistency 0/1
-# This is the one signal that requires a model call — keep it cheap
+# "The think trace says X. The submitted interval is Y. Are they consistent? yes/no"
+def trace_answer_consistency(think: str, interval: str) -> bool:
+    pass
 ```
 
-### Composite scorer
-
-Combine signals into a single trace quality score:
+**Composite score:**
 ```python
-def trace_quality(think_trace, rounds, gold):
-    entity_score = entity_hallucination_rate(think_trace)   # lower = better
-    convergence  = convergence_score(rounds)                 # higher = better
-    consistency  = trace_answer_consistency(think_trace, rounds[-1]["answer"])
-    return {
-        "entity_hallucination_rate": entity_score,
-        "convergence_score": convergence,
-        "trace_answer_consistency": consistency,
-        "composite": (1 - entity_score) * convergence * consistency
-    }
+def trace_quality(think, slip_log):
+    return (1 - entity_hallucination_rate(think)) \
+           * convergence_score(slip_log) \
+           * trace_answer_consistency(think, slip_log[-1])
 ```
 
-### Validate the scorer
+**Validation:** check that composite score correlates with `refinement_accuracy` across problems.
+A model with high trace quality but low refinement accuracy is a red flag worth reporting.
 
-On your held-out set, check: does composite score correlate with whether the model actually converged to the correct answer? If a model with a bad trace still gets the right answer, that's a red flag — worth flagging in your write-up.
-
-### Deliverable
-`scorer.py` — runnable script that takes `results.jsonl` and outputs `scored_traces.jsonl`. Include a `scorer_notes.md` describing: what each signal measures, failure modes, and correlation with final answer accuracy on your validation set.
+**Deliverable:** `scorer.py` (reads results.jsonl, writes scored_traces.jsonl) + `scorer_notes.md`.
 
 ---
 
-## Final Integration
+## Adding a new eval mode
 
-When all three areas are done, run:
-```
-tasks.jsonl → eval_loop.py → results.jsonl → scorer.py → scored_traces.jsonl
+1. Add `my_mode = "my-mode"` to `EvalMode` in `cli.py`
+2. Implement `run_my_mode(tasks, client, ...) -> dict` in `benchmark/runner.py`
+3. Add the dispatch block inside `with ResultWriter(...) as writer:` in `cli.py`
+4. Update `_tool_run_benchmark` in `benchmark/chat.py` and the tool schema's `mode` enum
+
+## Adding a new task source
+
+1. Add a branch in `load_tasks()` in `benchmark/loader.py`
+2. Return a list of task dicts with at minimum: `lb_id`, `format`, `messages`, and a numeric gold
+   value as the last assistant message content
+
+## Adding a new provider
+
+1. Add to the `Provider` enum in `cli.py`
+2. Handle it in `ModelClient.__init__` and `ModelClient.chat()` in `benchmark/client.py`
+3. Add to `provider_api_key()` and `provider_preflight()` in `benchmark/config.py`
+
+---
+
+## Config reference
+
+Stored at `~/.longevity/config.json`. Env vars override file values.
+
+| Key | Env var | Used for |
+|---|---|---|
+| `anthropic.api_key` | `ANTHROPIC_API_KEY` | Chat UI + anthropic provider |
+| `hf.token` | `HF_TOKEN` | LongeBench dataset + hf provider inference |
+| `openai.api_key` | `OPENAI_API_KEY` | openai provider |
+
+```bash
+python cli.py config set anthropic.api_key sk-ant-...
+python cli.py config list
 ```
 
-Final submission to the hackathon: all JSONL files + a short writeup covering benchmark design, scoring formula, and trace scorer validation.
+---
 
-**Aggregate score formula (lower is better):**
+## Common issues
+
+**LongeBench access denied**
+Request access at `huggingface.co/datasets/insilicomedicine/longebench`, then run `/setup`
+to re-verify. The token must be passed explicitly — setting `HF_TOKEN` env var also works.
+
+**Model returns no valid interval**
+The parser in `runner.py parse_interval()` accepts bare numbers, `[min, max]`, and loose
+whitespace. If the model writes text around the interval (e.g. "I think [20, 40] years"),
+the regex still finds it. After 3 consecutive parse failures the session terminates early.
+
+**prompt_toolkit not found**
+```bash
+pip install -r requirements.txt
 ```
-total_score = (10 + Σ width_factors for all correct final intervals) × 2^(# tasks never solved)
-```
+`prompt_toolkit>=3.0.0` is required for the `/` autocomplete menu in the chat UI.

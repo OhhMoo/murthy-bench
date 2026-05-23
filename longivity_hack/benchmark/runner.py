@@ -316,12 +316,33 @@ def run_estimathon(
 
 
 # ---------------------------------------------------------------------------
-# One-shot eval (unchanged, kept for baseline comparison)
+# One-shot eval
 # ---------------------------------------------------------------------------
+
+_ESTIMATHON_FORMATS = {"regression", "pairwise", "interval"}
+
+
+def _score_task(pred: str, gold: str, fmt: str) -> tuple[bool, float | None]:
+    """Format-aware scoring. Returns (correct, f1_or_None)."""
+    if fmt == "generation":
+        pred_tokens = {t.strip().lower() for t in re.split(r"[,;\s]+", pred) if t.strip()}
+        gold_tokens = {t.strip().lower() for t in re.split(r"[,;\s]+", gold) if t.strip()}
+        if not gold_tokens:
+            return False, 0.0
+        tp = len(pred_tokens & gold_tokens)
+        p = tp / len(pred_tokens) if pred_tokens else 0.0
+        r = tp / len(gold_tokens)
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        return f1 >= 0.5, f1
+    else:
+        exact = pred.strip().lower() == gold.strip().lower()
+        return exact, None
+
 
 def _run_one_shot(task: dict, client: ModelClient, enable_thinking: bool) -> dict:
     messages = task["messages"]
     gold = messages[-1]["content"].strip()
+    fmt = task.get("format", "")
     resp = client.chat(
         messages[:-1],
         max_tokens=500,
@@ -329,11 +350,11 @@ def _run_one_shot(task: dict, client: ModelClient, enable_thinking: bool) -> dic
         enable_thinking=enable_thinking,
     )
     pred = resp.answer.strip()
-    correct = pred.lower() == gold.lower()
-    return {
+    correct, f1 = _score_task(pred, gold, fmt)
+    result = {
         "lb_id": task.get("lb_id", ""),
         "domain": task.get("domain", ""),
-        "format": task.get("format", ""),
+        "format": fmt,
         "metric": task.get("metric", ""),
         "mode": "one-shot",
         "gold": gold,
@@ -342,6 +363,9 @@ def _run_one_shot(task: dict, client: ModelClient, enable_thinking: bool) -> dic
         "think": resp.think,
         "tokens_used": resp.tokens_used,
     }
+    if f1 is not None:
+        result["f1"] = f1
+    return result
 
 
 def run_eval(
@@ -368,3 +392,86 @@ def run_eval(
                 on_result(record)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Mixed eval — two-track: Estimathon for numerical, one-shot for categorical
+# ---------------------------------------------------------------------------
+
+def run_mixed(
+    tasks: list[dict],
+    client: ModelClient,
+    total_budget: int | None = None,
+    concurrency: int = 4,
+    enable_thinking: bool = False,
+    on_slip: Callable[[dict], None] | None = None,
+    on_result: Callable[[dict], None] | None = None,
+) -> dict:
+    """
+    Split tasks by format:
+      numerical (regression / pairwise / interval) → Estimathon with shared budget
+      categorical (binary / multiclass / ternary / generation) → one-shot accuracy
+
+    Returns a combined result dict with 'estimathon' and 'one_shot' sub-dicts.
+    """
+    numerical   = [t for t in tasks if t.get("format") in _ESTIMATHON_FORMATS]
+    categorical = [t for t in tasks if t.get("format") not in _ESTIMATHON_FORMATS]
+
+    estimathon_result: dict | None = None
+    one_shot_result:   dict | None = None
+
+    # --- Track 1: Estimathon ---
+    if numerical:
+        estimathon_result = run_estimathon(
+            tasks=numerical,
+            client=client,
+            total_budget=total_budget,
+            enable_thinking=enable_thinking,
+            on_slip=on_slip,
+        )
+
+    # --- Track 2: one-shot categorical ---
+    if categorical:
+        records: list[dict] = []
+
+        def _collect(r: dict) -> None:
+            records.append(r)
+            if on_result:
+                on_result(r)
+
+        run_eval(
+            tasks=iter(categorical),
+            client=client,
+            concurrency=concurrency,
+            enable_thinking=enable_thinking,
+            on_result=_collect,
+        )
+
+        by_format: dict[str, dict] = {}
+        for r in records:
+            fmt = r.get("format", "unknown")
+            bucket = by_format.setdefault(fmt, {"n": 0, "correct": 0})
+            bucket["n"] += 1
+            if r.get("correct"):
+                bucket["correct"] += 1
+        for bucket in by_format.values():
+            bucket["accuracy"] = bucket["correct"] / bucket["n"] if bucket["n"] else 0.0
+
+        n_total   = len(records)
+        n_correct = sum(1 for r in records if r.get("correct"))
+        one_shot_result = {
+            "mode":      "one-shot",
+            "n_tasks":   n_total,
+            "n_correct": n_correct,
+            "accuracy":  n_correct / n_total if n_total else 0.0,
+            "by_format": by_format,
+            "records":   records,
+        }
+
+    return {
+        "mode":          "mixed",
+        "n_numerical":   len(numerical),
+        "n_categorical": len(categorical),
+        "estimathon":    estimathon_result,
+        "one_shot":      one_shot_result,
+    }
