@@ -22,17 +22,39 @@ The CLI is fully built. All three original hackathon areas map as follows:
 
 ## Quick start
 
+1. **Setup environment**:
 ```bash
 cd longivity_hack
+cp .env.example .env
+# Edit .env and add your HF_TOKEN (from ask.py or generate at https://huggingface.co/settings/tokens)
+```
+
+2. **Install dependencies**:
+```bash
 pip install -r requirements.txt
+```
+
+3. **Load environment and run**:
+```bash
+source .env
 python cli.py          # opens interactive chat
 ```
 
 In chat, run `/setup` to configure API keys and verify LongeBench access.
 
-To run a benchmark directly:
+**Test L-LLM directly** (no other API keys needed):
 ```bash
-python cli.py run --model claude-sonnet-4-6 --provider anthropic --tasks longebench --mode mixed --limit 50
+source .env
+python cli.py run --model longevity-llm --provider endpoint \
+  --endpoint $L_LLM_ENDPOINT --api-key $HF_TOKEN \
+  --tasks sample --mode estimathon --limit 7
+```
+
+Or run a full LongeBench benchmark:
+```bash
+python cli.py run --model longevity-llm --provider endpoint \
+  --endpoint $L_LLM_ENDPOINT --api-key $HF_TOKEN \
+  --tasks longebench --mode mixed --limit 100
 ```
 
 ---
