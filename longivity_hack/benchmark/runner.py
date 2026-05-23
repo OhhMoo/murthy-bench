@@ -111,7 +111,7 @@ def _build_system_prompt(n_problems: int, total_budget: int) -> str:
 
 Rules:
 - You have {total_budget} slips total across {n_problems} problems.
-- Each slip: choose a problem number and submit an interval [min, max].
+- Each slip: submit ONE interval for ONE problem only. Do not submit multiple problems in a single message.
 - Intervals must be positive (no zero, no negatives).
 - An interval is GOOD if it contains the correct answer.
 - ONLY your LAST submission for each problem counts toward your final score.
@@ -126,11 +126,15 @@ Strategy:
 - Unsolved problems double your score — cover all {n_problems} problems first.
 - You receive ONLY binary feedback: GOOD or BAD. No direction hints.
 
-After each submission you will see your live score and standings.
+After each submission you will see feedback, your updated score, and the standings.
 
-Format your submissions exactly as:
+Format EVERY submission exactly as (on separate lines):
 PROBLEM <number>
-INTERVAL [min, max]"""
+INTERVAL [min, max]
+
+Example: If submitting for Problem 3, write:
+PROBLEM 3
+INTERVAL [45, 78]"""
 
 
 def _build_standings(session: EstimathonSession) -> str:
