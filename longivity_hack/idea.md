@@ -117,6 +117,41 @@ Specific signals to extract:
 
 ---
 
+## LongeBench Integration & Estimathon Adapter
+
+The benchmark can run against the full InSilico LongeBench dataset (32K+ tasks) via an automated transformation layer:
+
+### Task Filtering
+LongeBench contains 6 task formats: regression, pairwise, binary, multiclass, ternary, generation.
+Only **regression** and **pairwise** tasks are compatible with interval-based estimathon scoring
+(they have numeric gold values). Non-numeric tasks are filtered out automatically.
+
+### Prompt Transformation
+Raw LongeBench tasks ask for a single point answer. The adapter rewrites them to ask for intervals:
+
+**Before (raw LongeBench):**
+```
+"Given methylation profile M1, M2, M3, predict the age."
+Gold: "65.3"
+```
+
+**After (estimathon format):**
+```
+"Given methylation profile M1, M2, M3, predict the age.
+Submit an interval [min, max] for your answer. Reply with only: [min, max]"
+Gold: 65.3 (as float)
+```
+
+### Gold Extraction
+LongeBench assistant messages often contain multi-line reasoning. The adapter extracts numeric gold robustly:
+- Tries direct float parse first
+- Falls back to regex for the last number in text
+- Handles units ("67 years"), scientific notation ("5e2"), reasoning traces
+
+This enables safe merging of 5K+ regression tasks from LongeBench into estimathon sessions without manual curation.
+
+---
+
 ## Dataset Construction
 
 Source data: AnAge (multispecies lifespan), GEO DNAm arrays (epigenetic age), NHANES (clinical biomarkers). Split by species class / GSE accession / survey cycle to prevent leakage.

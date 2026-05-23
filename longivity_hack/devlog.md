@@ -207,3 +207,124 @@ Rich's console state.
 - `devlog.md` (this file)
 
 ---
+
+## 2026-05-23 — LongeBench → Estimathon adapter (chat integration)
+
+### Context
+
+After pulling main, the loader was reset to the original iterator version (no `estimathon` flag).
+The new `chat.py` module also calls `load_tasks()` without it. This caused a silent bug when
+running LongeBench in estimathon mode via chat:
+
+1. `_tool_run_benchmark(tasks_source="longebench", mode="estimathon")`
+2. `load_tasks("longebench")` yields raw rows (gold = multi-line reasoning)
+3. `_extract_gold` calls `float(messages[-1]["content"])` → `ValueError` → returns `None`
+4. All golds become `None` → every submission marked `BAD` → session degrades immediately
+
+No error was raised — the session just silently ran with broken gold values.
+
+### Solution: Re-apply transformation layer + wire through chat pipeline
+
+**loader.py:** Re-added `_extract_lb_gold()`, `_transform_lb_to_estimathon()`,
+`ESTIMATHON_COMPATIBLE_FORMATS`, and updated `load_tasks()` signature to accept `estimathon` flag.
+Return type changed from `Iterator[dict]` to `list[dict]` (already used as list in chat.py).
+
+- `_extract_lb_gold()` — robust numeric extractor for LongeBench assistant content
+- `_transform_lb_to_estimathon()` — filters to regression/pairwise, rewrites prompts, converts gold to float
+- `load_tasks(source, limit, estimathon=False)` — applies transform when `estimathon=True` and source is longebench*
+
+**Filtering strategy:**
+- `"sample"` → no transform (already estimathon-ready)
+- `"longebench*"` + `estimathon=True` → filter to regression/pairwise, rewrite prompts
+- `"<local.jsonl>"` → no transform (user confirmed: assume already correct format)
+
+**chat.py:** Updated tool implementations:
+- `_tool_run_benchmark()` — now passes `estimathon=(mode == "estimathon")` to `load_tasks()`
+  Adds filter note to console when longebench + estimathon
+- `_tool_preview_tasks()` — keeps `estimathon=False` (raw view) but adds tip about filtering
+
+**cli.py:** Same `estimathon=` flag pass-through in `run` command, plus filter note.
+
+### Design decisions
+
+**Preview shows raw tasks (all formats):** Intuitive for dataset exploration. Estimathon mode
+filters on the backend when actually running; users see the truth on `/question_set`.
+
+**Local JSONL skips transform:** Custom task files are assumed already estimathon-ready if the
+user is running them in estimathon mode. Safer than auto-transforming and potentially breaking them.
+
+### Files modified
+- `benchmark/loader.py`: added transformation functions; updated `load_tasks()` signature/return type
+- `benchmark/chat.py`: pass `estimathon=` flag; add filter notes and hints
+- `cli.py`: pass `estimathon=` flag; add filter note
+- `idea.md`: documented LongeBench integration strategy
+- `devlog.md` (this file)
+
+---
+
+## 2026-05-23 — CLI Pipeline Logic & Documentation
+
+### Summary
+
+Completed a comprehensive review and documentation of how the Murphy CLI works end-to-end.
+The system supports two evaluation modes (one-shot and estimathon) with different answer-grabbing
+and feedback strategies.
+
+### Key Architecture
+
+**One-shot mode** (parallel evaluation):
+- Spawns up to 8 concurrent threads, each evaluating one task independently
+- Sends `messages[:-1]` (stripping gold) to the model
+- Uses naive string comparison: `pred.lower() == gold.lower()`
+- Records: {correct: bool, gold, pred, think}
+- Fragile: "211 years" ≠ "211" → marked incorrect despite containing the right number
+
+**Estimathon mode** (iterative session):
+- Single sequential conversation with shared budget (default `floor(1.38 × N)` slips)
+- Model submits structured: `PROBLEM <N>\nINTERVAL [min, max]`
+- Strict regex parsing: extracts problem number and interval bounds as floats
+- Robust gold comparison: `pmin <= gold <= pmax`
+- Live feedback loop: GOOD/BAD signal + score delta + standings table
+- Refinement accuracy: tracks bets (re-submissions on GOOD intervals) and success rate
+
+**Answer-grabbing flow:**
+1. Load tasks → extract golds from `messages[-1]["content"]`
+2. Create client (routes to Anthropic/OpenAI/HuggingFace/custom endpoint)
+3. Build conversation (system prompt + all problems)
+4. Loop: send → parse response → check gold → give feedback → repeat
+5. Exit when budget exhausted or 3 parse failures
+6. Compute final score and refinement accuracy
+
+**Model client abstraction** (`benchmark/client.py`):
+- Provider-agnostic interface: routes to appropriate SDK
+- Anthropic SDK for `provider="anthropic"`
+- OpenAI SDK for `provider="openai"` (default), `"hf"` (HuggingFace endpoint), `"endpoint"` (custom)
+- Thinking trace extraction: separates `<think>...</think>` blocks from answer
+- Temperature: always 0.0 (deterministic)
+- Max tokens: 500 (one-shot), 600–3000 (estimathon, depends on thinking)
+
+### Integration Points
+
+- **Loader** → supplies tasks with golds and message format
+- **Runner** → orchestrates session logic and feedback loop
+- **Client** → sends/receives from models
+- **Chat UI** → provides interactive tools and slash commands
+- **CLI** → entry point for command-line runs
+
+### Testing Done
+
+✅ Loader transformation (LongeBench → estimathon format)
+✅ Gold extraction (robust numeric parsing)
+✅ One-shot parallel evaluation
+✅ Estimathon multi-turn session with parsing
+✅ Chat tool integration (`_tool_run_benchmark`, `_tool_preview_tasks`)
+✅ Model client routing (Anthropic, OpenAI APIs)
+✅ Thinking trace splitting
+
+### Documentation Added
+
+- `idea.md` — LongeBench integration strategy (filtering, gold extraction, prompt transformation)
+- `devlog.md` — this entry (CLI pipeline logic and architecture)
+- Detailed comments in `loader.py`, `runner.py`, `client.py`
+
+---

@@ -198,7 +198,7 @@ def _resolve_client(model: str, provider: str, api_key: str | None, endpoint_url
 
 def _tool_preview_tasks(source: str, limit: int = 7) -> str:
     try:
-        task_list = list(load_tasks(source, limit=limit))
+        task_list = load_tasks(source, limit=limit, estimathon=False)
     except Exception as exc:
         return f"Error: {exc}"
 
@@ -212,7 +212,10 @@ def _tool_preview_tasks(source: str, limit: int = 7) -> str:
         table.add_row(t.get("lb_id", ""), t.get("domain", ""), t.get("format", ""), gold)
     console.print(table)
     lines = [f"{t.get('lb_id','')} | {t.get('domain','')} | gold≈{(t.get('messages') or [{}])[-1].get('content','')[:8]}" for t in task_list]
-    return f"Loaded {len(task_list)} tasks from '{source}':\n" + "\n".join(lines)
+    result = f"Loaded {len(task_list)} tasks from '{source}':\n" + "\n".join(lines)
+    if source.startswith("longebench"):
+        result += "\n  [dim](tip: estimathon mode filters to regression tasks only)[/dim]"
+    return result
 
 
 def _tool_check_model(model: str, provider: str, api_key: str | None = None, endpoint_url: str | None = None) -> str:
@@ -238,7 +241,7 @@ def _tool_run_benchmark(
     if isinstance(client, str):
         return client
     try:
-        task_list = list(load_tasks(tasks_source, limit=limit))
+        task_list = load_tasks(tasks_source, limit=limit, estimathon=(mode == "estimathon"))
     except Exception as exc:
         return f"Error loading tasks: {exc}"
     if not task_list:
@@ -252,6 +255,8 @@ def _tool_run_benchmark(
         f"[green]Think:[/green] {think}",
         border_style="green", expand=False,
     ))
+    if mode == "estimathon" and tasks_source.startswith("longebench"):
+        console.print("  [dim green]Filtered to regression-compatible tasks (interval format)[/dim green]")
 
     with ResultWriter(output) as writer:
         if mode == "estimathon":
