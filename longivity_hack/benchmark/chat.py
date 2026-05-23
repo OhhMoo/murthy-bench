@@ -26,7 +26,7 @@ from . import config as cfg
 from .client import ModelClient
 from .loader import load_tasks
 from .results import ResultWriter
-from .runner import run_estimathon, run_eval, run_mixed
+from .runner import run_estimathon, run_eval, run_mixed, _fmt_score
 
 console = Console()
 
@@ -63,6 +63,7 @@ _TAGLINE = "Longevity LLM Benchmark  ·  Estimathon-style evaluation"
 _SLASH_META = [
     ("/help",         "Show all commands"),
     ("/setup",        "Configure API keys and HuggingFace dataset access"),
+    ("/test",         "Estimathon trial: 20 longebench tasks, 40-slip budget"),
     ("/exit",         "Exit the chat"),
     ("/clear",        "Clear conversation history"),
     ("/model",        "Show or set benchmark model"),
@@ -265,14 +266,29 @@ def _tool_run_benchmark(
         good = r.get("good", False)
         wf   = r.get("width_factor")
         bar  = "█" * min(wf or 0, 20) if good else "░" * 10
+        display_id = r.get("lb_id") or r["pid"]
+        attempts_left = r.get("attempts_left")
+        attempt_tag = (
+            f"  [dim]({attempts_left} left)[/dim]" if attempts_left is not None and attempts_left > 0
+            else (f"  [yellow](locked)[/yellow]" if attempts_left == 0 else "")
+        )
         console.print(
             f"  [dim]#{r['slip']:02d}[/dim]  "
-            f"[cyan]{r['pid']:<18}[/cyan]  "
+            f"[cyan]{r['pid']:<5}[/cyan] [dim]{display_id:<14}[/dim]  "
             f"[{'green' if good else 'red'}]{'GOOD' if good else 'BAD '}[/]"
             + (f"  [green]{bar}[/green] w={wf}" if good else f"  [red]{bar}[/red]")
-            + f"  [dim]{r['score_before']} → {r['score_after']}[/dim]"
+            + f"  [dim]{_fmt_score(r['score_before'])} → {_fmt_score(r['score_after'])}[/dim]"
             + (" [yellow]⚠ lost good[/yellow]" if r.get("prev_was_good") and not good else "")
+            + attempt_tag
         )
+        # Debug: show the question text and raw model response
+        question = r.get("task_content", "")
+        if question:
+            q_preview = question[:300].replace("\n", " ")
+            console.print(f"     [dim]Q:[/dim] [dim]{q_preview}[/dim]")
+        raw = r.get("raw_response", "")
+        if raw:
+            console.print(f"     [dim]→[/dim] [dim]{raw[:200]}[/dim]")
 
     def _result_line(r: dict) -> None:
         ok = r.get("correct", False)
@@ -465,6 +481,7 @@ def _help_panel() -> None:
     rows = [
         ("/help",         "",                        "Show this help"),
         ("/setup",        "",                        "Configure API keys + verify HuggingFace access"),
+        ("/test",         "",                        "Estimathon trial: 20 longebench tasks, 40-slip budget"),
         ("/exit",         "",                        "Exit the chat"),
         ("/clear",        "",                        "Clear conversation history"),
         ("/model",        "[bench-model]",           "Show or set default benchmark model"),
@@ -491,6 +508,21 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
 
     if cmd == "/setup":
         _setup_wizard()
+        return True
+
+    if cmd == "/test":
+        console.print(
+            "[dim]Estimathon trial — 20 longebench regression tasks, 40-slip budget…[/dim]"
+        )
+        _tool_run_benchmark(
+            model=state.bench_model,
+            provider=state.bench_provider,
+            tasks_source="longebench",
+            mode="estimathon",
+            budget=40,
+            limit=20,
+            think=state.think_mode,
+        )
         return True
 
     if cmd == "/exit":

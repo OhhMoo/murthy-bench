@@ -22,12 +22,22 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.table import Table
 
-from benchmark import config as cfg
-from benchmark.chat import run_chat
-from benchmark.client import ModelClient
-from benchmark.loader import load_tasks
-from benchmark.results import ResultWriter
-from benchmark.runner import run_eval, run_estimathon, run_mixed
+try:
+    # installed as a package: longivity_hack.cli
+    from .benchmark import config as cfg
+    from .benchmark.chat import run_chat
+    from .benchmark.client import ModelClient
+    from .benchmark.loader import load_tasks
+    from .benchmark.results import ResultWriter
+    from .benchmark.runner import run_eval, run_estimathon, run_mixed, _fmt_score
+except ImportError:
+    # local dev: python cli.py from inside longivity_hack/
+    from benchmark import config as cfg
+    from benchmark.chat import run_chat
+    from benchmark.client import ModelClient
+    from benchmark.loader import load_tasks
+    from benchmark.results import ResultWriter
+    from benchmark.runner import run_eval, run_estimathon, run_mixed, _fmt_score
 
 app = typer.Typer(
     name="longevity",
@@ -67,7 +77,7 @@ def run(
     mode: EvalMode = typer.Option(EvalMode.one_shot, "--mode", help="one-shot | estimathon | mixed"),
     output: Path = typer.Option(Path("results.jsonl"), "--output", "-o", help="Output file path"),
     concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=8, help="Parallel requests for one-shot (max 8)"),
-    budget: Optional[int] = typer.Option(None, "--budget", "-b", help="Total slips for estimathon (default: auto ~1.38×N)"),
+    budget: Optional[int] = typer.Option(None, "--budget", "-b", help="Total slips for estimathon (default: auto floor(18/13 × N))"),
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Cap number of tasks"),
     think: bool = typer.Option(False, "--think/--no-think", help="Enable chain-of-thought traces"),
 ):
@@ -140,9 +150,15 @@ def run(
                     f"[cyan]{record['pid']}[/cyan]  "
                     f"[{'green' if good else 'red'}]{'GOOD' if good else 'BAD '}[/]"
                     + (f"  width={wf}" if wf is not None else "")
-                    + f"  score {score_before} {direction} {score_after}"
+                    + f"  score {_fmt_score(score_before)} {direction} {_fmt_score(score_after)}"
                     + (f"  [yellow]⚠ lost good interval[/yellow]" if record.get("prev_was_good") and not good else "")
                 )
+                question = record.get("task_content", "")
+                if question:
+                    console.print(f"     [dim]Q:[/dim] [dim]{question[:300].replace(chr(10), ' ')}[/dim]")
+                raw = record.get("raw_response", "")
+                if raw:
+                    console.print(f"     [dim]→[/dim] [dim]{raw[:200]}[/dim]")
 
             session_result = run_estimathon(
                 tasks=task_list,
@@ -157,7 +173,7 @@ def run(
             ref_str = f"{ref_acc:.0%}" if ref_acc is not None else "n/a"
             console.print(
                 Panel(
-                    f"Final score:  [bold]{session_result['final_score']}[/bold]  (lower is better)\n"
+                    f"Final score:  [bold]{_fmt_score(session_result['final_score'])}[/bold]  (lower is better)\n"
                     f"Problems solved:  {session_result['n_good_final']} / {session_result['n_problems']}\n"
                     f"Slips used:  {session_result['slips_used']} / {session_result['total_budget']}\n"
                     f"Refinement accuracy:  {ref_str}  "
@@ -181,9 +197,15 @@ def run(
                     f"[cyan]{record['pid']}[/cyan]  "
                     f"[{'green' if good else 'red'}]{'GOOD' if good else 'BAD '}[/]"
                     + (f"  width={wf}" if wf is not None else "")
-                    + f"  score {sb} {direction} {sa}"
+                    + f"  score {_fmt_score(sb)} {direction} {_fmt_score(sa)}"
                     + ("  [yellow]⚠ lost good[/yellow]" if record.get("prev_was_good") and not good else "")
                 )
+                question = record.get("task_content", "")
+                if question:
+                    console.print(f"     [dim]Q:[/dim] [dim]{question[:300].replace(chr(10), ' ')}[/dim]")
+                raw = record.get("raw_response", "")
+                if raw:
+                    console.print(f"     [dim]→[/dim] [dim]{raw[:200]}[/dim]")
 
             cat_table = Table(show_lines=False)
             cat_table.add_column("lb_id",  style="cyan", no_wrap=True)
@@ -221,7 +243,7 @@ def run(
                 ref_str = f"{ref_acc:.0%}" if ref_acc is not None else "n/a"
                 console.print(Panel(
                     f"[bold]Track 1 — Estimathon[/bold]  ({mixed_result['n_numerical']} numerical tasks)\n"
-                    f"Final score:  [bold]{er['final_score']}[/bold]  (lower is better)\n"
+                    f"Final score:  [bold]{_fmt_score(er['final_score'])}[/bold]  (lower is better)\n"
                     f"Problems solved:  {er['n_good_final']} / {er['n_problems']}\n"
                     f"Slips used:  {er['slips_used']} / {er['total_budget']}\n"
                     f"Refinement accuracy:  {ref_str}",

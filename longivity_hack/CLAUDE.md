@@ -81,7 +81,7 @@ cli.py            Typer app — run / chat / status / tasks / config commands
 score = (10 + Σ floor(max/min) for GOOD final answers) × 2^(N − # good final answers)
 ```
 Lower is better. Only the **last** submission per problem counts.
-Default budget: `floor(1.38 × N)` slips, matching the real Estimathon's 18/13 ratio.
+Default budget: `floor(18/13 × N)` slips, matching the real Estimathon's 18-slip / 13-problem ratio.
 
 ### Binary-only feedback
 The model receives GOOD or BAD — **no directional hints** ("too high / too low").
