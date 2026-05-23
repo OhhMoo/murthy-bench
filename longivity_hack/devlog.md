@@ -399,3 +399,98 @@ and feedback strategies.
 - Detailed comments in `loader.py`, `runner.py`, `client.py`
 
 ---
+
+## 2026-05-23 — Benchmark bugs fixed + [1,100] trivial interval observation
+
+### Bugs fixed this session
+
+**1. Python 3.11 integer-to-string limit crash**
+`10 × 2^N` for N=14,000+ tasks exceeds Python 3.11's 4300-digit int→str conversion guard.
+Fix: `sys.set_int_max_str_digits(0)` at runner import time + `_fmt_score()` helper that
+renders large scores as `1.23e45` using pure integer arithmetic (bit_length → exponent)
+to avoid float overflow on astronomically large values.
+
+**2. `pairwise` tasks routed to Estimathon**
+LongeBench `format="pairwise"` tasks ask "which individual is older? A or B" — gold is a
+letter, not a number. Our `_ESTIMATHON_FORMATS` included `"pairwise"`, so `_extract_gold`
+tried `float("A")` → `None`, and every submission was permanently BAD.
+Fix: removed `"pairwise"` from `_ESTIMATHON_FORMATS`. Pairwise tasks now go to the one-shot
+track and are scored by exact-match.
+
+**3. Duplicate lb_id collapses all problems into one**
+All 100 numerical tasks sampled from LongeBench shared `lb_id = "LB-0010"`. This meant
+`session.last_submissions["LB-0010"]` was overwritten on every slip — the model was
+effectively submitting to the same single problem regardless of which PROBLEM number it chose.
+Fix: pids are now position-based (`P1`, `P2`, …, `P100`). The lb_id is preserved as a
+display label but is not used as a dict key.
+
+**4. No per-problem attempt cap**
+The model could waste the entire budget on one problem. Added `_MAX_SLIPS_PER_PROBLEM = 3`.
+After 3 submissions on a problem it is locked — the next attempt to submit to it is rejected
+without consuming a slip and the model is told to choose a different problem.
+Each feedback message now includes "Attempts left on Problem Px: Y/3" so the model knows
+when to move on.
+
+**5. Model outputting reasoning prose instead of structured format**
+The model was responding with multi-paragraph reasoning instead of the mandatory two-line
+`PROBLEM N / INTERVAL [min, max]` block, causing parse failures.
+Fix: added explicit constraint to system prompt: *"Your entire response must be ONLY these
+two lines. No explanation. No reasoning. No other text. Any other format will be ignored."*
+Nudge message on parse failure now says "FORMAT ERROR" (not "could not parse").
+
+### Observation: [1, 100] trivial interval exploit
+
+**Discovered during live run with sonnet-4-5 on LongeBench age estimation tasks.**
+
+All 100 numerical tasks sampled were from `LB-0010` (age estimation from DNA methylation,
+regression format). The model immediately found a dominant strategy:
+
+```
+INTERVAL [1, 100]   →   w = floor(100/1) = 100, GOOD for every task
+```
+
+Since human ages fall in [1, 100], this single interval is correct for all age estimation
+problems. With 100 problems covered at w=100:
+
+```
+score = (10 + 100 × 100) × 2^0 = 10,010
+```
+
+vs. any unsolved problems:
+
+```
+1 unsolved:   (10 + 99 × 100) × 2^1 = 19,820   →  worse than 10,010
+```
+
+The model rationally chose to cover all problems first even at w=100 rather than try to
+narrow any single problem and risk leaving others unsolved.
+
+**Implication for benchmark design:**
+This is a valid finding. A trivial baseline of `[1, 100]` scores 10,010 on any all-age
+dataset. A biologically-informed model should score significantly better by narrowing
+intervals based on demographic and methylation clues. This makes `[1, 100]` a natural
+baseline: if the L-LLM cannot beat 10,010, it has no advantage over random wide guessing.
+
+**To reproduce:**
+```bash
+python cli.py run --model claude-sonnet-4-5 --provider anthropic \
+  --tasks longebench --mode estimathon --limit 100
+```
+
+### /test command updated
+
+Changed `/test` from 7 built-in sample tasks to a proper trial run:
+- **20 regression tasks** from LongeBench (requires HF token)
+- **40-slip budget** (roughly 2× the default `floor(1.38 × 20) = 27`)
+- Mode: `estimathon` (pure interval track, no categorical mixing)
+
+This gives the model room to both cover all problems AND attempt refinements, revealing
+whether it can beat the [1, 100] baseline through domain reasoning.
+
+### Files modified
+- `benchmark/runner.py`: `_fmt_score`, `sys.set_int_max_str_digits`, `_ESTIMATHON_FORMATS`,
+  position-based pids, `_MAX_SLIPS_PER_PROBLEM`, attempt tracking, format-constraint system prompt
+- `benchmark/chat.py`: `/test` updated to 20 tasks / 40-slip budget; debug Q+response lines
+  in `_slip_line`; `lb_id` + `attempts_left` display
+- `cli.py`: `_fmt_score` in all score display sites
+- `devlog.md` (this file)

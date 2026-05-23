@@ -1,13 +1,40 @@
 import math
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Iterator
 
 from .client import ModelClient
 
+# Python 3.11+ added a 4300-digit limit on int→str conversion (CVE guard).
+# Estimathon scores are legitimately huge (10 × 2^N) — remove the cap.
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)
+
+
+def _fmt_score(n: int) -> str:
+    """Compact display for Estimathon scores. Uses integer arithmetic to avoid
+    float overflow on astronomically large values (e.g. 10 × 2^14000)."""
+    if n < 1_000_000:
+        return str(n)
+    bits = n.bit_length() - 1            # floor(log2(n))
+    exp = int(bits * 0.30103)            # floor(log10(n)) estimate
+    p10 = 10 ** exp
+    if p10 * 10 <= n:                    # adjust if off by one
+        exp += 1
+        p10 *= 10
+    q = n // p10
+    frac = (n % p10) * 100 // p10       # two decimal places
+    return f"{q}.{frac:02d}e{exp}"
+
 _MAX_CONCURRENCY = 8
 _PROBLEM_CONTENT_LIMIT = 1500  # chars per problem shown in session prompt
+# Estimathon sends ALL problems in one context window. Cap to avoid blowing
+# token limits when running mixed mode against the full LongeBench dataset.
+_MAX_ESTIMATHON_PROBLEMS = 100
+# Maximum number of slips a model may spend on a single problem.
+_MAX_SLIPS_PER_PROBLEM = 3
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +63,7 @@ class EstimathonSession:
     last_submissions: dict = field(default_factory=dict)   # pid → (min, max)
     golds: dict = field(default_factory=dict)              # pid → float
     slip_log: list = field(default_factory=list)
+    per_problem_slips: dict = field(default_factory=dict)  # pid → attempt count
 
     @property
     def n_problems(self) -> int:
@@ -112,10 +140,11 @@ def _build_system_prompt(n_problems: int, total_budget: int) -> str:
 Rules:
 - You have {total_budget} slips total across {n_problems} problems.
 - Each slip: choose a problem number and submit an interval [min, max].
-- Intervals must be positive (no zero, no negatives).
-- An interval is GOOD if it contains the correct answer.
+- Intervals must have positive values (min > 0, max > min).
+- An interval is GOOD if it contains the correct numeric answer.
 - ONLY your LAST submission for each problem counts toward your final score.
 - If you refine a GOOD interval and your new interval is BAD, you lose that problem.
+- You may attempt each problem AT MOST {_MAX_SLIPS_PER_PROBLEM} times. After that it is locked — choose a different problem.
 
 Scoring formula (lower is better):
   (10 + sum of floor(max/min) for all GOOD final intervals) × 2^({n_problems} − number of GOOD final answers)
@@ -125,12 +154,15 @@ Strategy:
 - Narrow intervals score better but risk being wrong.
 - Unsolved problems double your score — cover all {n_problems} problems first.
 - You receive ONLY binary feedback: GOOD or BAD. No direction hints.
+- Spread your slips across problems — do not waste all slips on one problem.
 
-After each submission you will see your live score and standings.
+OUTPUT FORMAT — THIS IS MANDATORY:
+Your entire response must be ONLY these two lines. No explanation. No reasoning. No other text.
 
-Format your submissions exactly as:
 PROBLEM <number>
-INTERVAL [min, max]"""
+INTERVAL [min, max]
+
+Any response that is not exactly this format will be ignored."""
 
 
 def _build_standings(session: EstimathonSession) -> str:
@@ -158,7 +190,7 @@ def _build_initial_user_message(session: EstimathonSession) -> str:
         parts.append(f"--- Problem {i+1}  [{domain}  |  {metric}] ---\n{content}\n")
 
     parts.append(
-        f"\nStarting score: {session.current_score()}  "
+        f"\nStarting score: {_fmt_score(session.current_score())}  "
         f"(all {session.n_problems} problems unsolved)\n"
         f"Slips remaining: {session.total_budget}\n\n"
         "Submit your first interval:\n"
@@ -179,13 +211,21 @@ def _build_feedback(result: dict, session: EstimathonSession) -> str:
             "Your new BAD submission replaced it — this problem now counts as wrong."
         )
 
-    score_line = f"Score: {result['score_before']} → {result['score_after']}"
+    score_line = f"Score: {_fmt_score(result['score_before'])} → {_fmt_score(result['score_after'])}"
     if result["score_after"] < result["score_before"]:
         score_line += "  ↓ improved"
     elif result["score_after"] > result["score_before"]:
         score_line += "  ↑ worsened"
 
     standings = _build_standings(session)
+
+    # Per-problem attempt status
+    attempts_used = result.get("attempts_used", 1)
+    attempts_left = result.get("attempts_left", 0)
+    if attempts_left == 0:
+        attempt_note = f"  Problem {result['pid']} is now LOCKED (all {_MAX_SLIPS_PER_PROBLEM} attempts used)."
+    else:
+        attempt_note = f"  Attempts left on Problem {result['pid']}: {attempts_left}/{_MAX_SLIPS_PER_PROBLEM}."
 
     if session.slips_remaining == 0:
         next_prompt = "No slips remaining. Session complete."
@@ -199,6 +239,7 @@ def _build_feedback(result: dict, session: EstimathonSession) -> str:
 
     return (
         f"Problem [{result['pid']}]: {good_str}.{width_note}{warning}\n"
+        f"{attempt_note}\n"
         f"{score_line}\n\n"
         f"Standings:\n{standings}\n\n"
         f"{next_prompt}"
@@ -227,16 +268,17 @@ def run_estimathon(
     """
     Run a full Estimathon session: shared budget, binary feedback, last-submission-counts.
 
-    total_budget defaults to floor(1.38 × n_problems) matching the real 18-slip / 13-problem ratio.
+    total_budget defaults to floor(18/13 × n_problems) matching the real Estimathon ratio.
     """
     n = len(tasks)
     if total_budget is None:
-        total_budget = max(n + 1, math.floor(1.38 * n))
+        total_budget = max(n + 1, math.floor(18 / 13 * n))
 
     session = EstimathonSession(tasks=tasks, total_budget=total_budget)
 
-    for task in tasks:
-        pid = task.get("lb_id", "")
+    # Use position-based pids so duplicate lb_ids don't collapse into one entry.
+    for i, task in enumerate(tasks):
+        pid = f"P{i + 1}"
         gold = _extract_gold(task)
         if gold is not None:
             session.golds[pid] = gold
@@ -249,12 +291,29 @@ def run_estimathon(
     parse_failures = 0
 
     while session.slips_remaining > 0:
-        resp = client.chat(
-            conversation,
-            max_tokens=3000 if enable_thinking else 600,
-            temperature=0.0,
-            enable_thinking=enable_thinking,
-        )
+        try:
+            resp = client.chat(
+                conversation,
+                max_tokens=3000 if enable_thinking else 600,
+                temperature=0.0,
+                enable_thinking=enable_thinking,
+            )
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "rate_limit" in msg or "429" in msg:
+                print(
+                    f"\n[Estimathon] Rate limit hit after {session.slips_used} slips. "
+                    f"Use --limit to run fewer tasks (current: {n} problems). "
+                    f"Returning partial results."
+                )
+            elif "context" in msg or "too long" in msg or "token" in msg:
+                print(
+                    f"\n[Estimathon] Context too long ({n} problems). "
+                    f"Use --limit to cap tasks. Returning partial results."
+                )
+            else:
+                print(f"\n[Estimathon] API error: {exc}. Returning partial results.")
+            break
 
         problem_num, pmin, pmax = _parse_estimathon_response(resp.answer)
 
@@ -263,7 +322,7 @@ def run_estimathon(
             if parse_failures >= 3:
                 break  # give up if model can't format
             nudge = (
-                "Could not parse your submission. Reply with exactly:\n"
+                "FORMAT ERROR. Output ONLY these two lines, nothing else:\n"
                 "PROBLEM <number>\n"
                 "INTERVAL [min, max]\n\n"
                 f"Slips remaining: {session.slips_remaining}"
@@ -280,10 +339,34 @@ def run_estimathon(
             conversation.append({"role": "user", "content": f"Problem {problem_num} does not exist. Choose 1–{n}."})
             continue
 
-        pid = tasks[task_idx].get("lb_id", f"P{problem_num}")
+        pid = f"P{problem_num}"
+
+        # Enforce per-problem attempt cap — reject without burning a slip.
+        attempts_so_far = session.per_problem_slips.get(pid, 0)
+        if attempts_so_far >= _MAX_SLIPS_PER_PROBLEM:
+            conversation.append({"role": "assistant", "content": resp.answer})
+            conversation.append({
+                "role": "user",
+                "content": (
+                    f"Problem {problem_num} is LOCKED — you have already used all "
+                    f"{_MAX_SLIPS_PER_PROBLEM} attempts on it. "
+                    f"Choose a different problem.\n\n"
+                    f"Slips remaining: {session.slips_remaining}"
+                ),
+            })
+            continue
+
+        session.per_problem_slips[pid] = attempts_so_far + 1
+        attempts_used = attempts_so_far + 1
+        attempts_left = _MAX_SLIPS_PER_PROBLEM - attempts_used
+
         result = session.submit(pid, pmin, pmax)
         result["think"] = resp.think
         result["raw_response"] = resp.answer
+        result["task_content"] = _problem_content(tasks[task_idx])
+        result["lb_id"] = tasks[task_idx].get("lb_id", pid)
+        result["attempts_used"] = attempts_used
+        result["attempts_left"] = attempts_left
 
         if on_slip:
             on_slip(result)
@@ -319,7 +402,9 @@ def run_estimathon(
 # One-shot eval
 # ---------------------------------------------------------------------------
 
-_ESTIMATHON_FORMATS = {"regression", "pairwise", "interval"}
+# "pairwise" tasks in LongeBench are categorical comparisons (answer = "A" or "B"),
+# not numerical predictions. Only regression/interval have numeric gold values.
+_ESTIMATHON_FORMATS = {"regression", "interval"}
 
 
 def _score_task(pred: str, gold: str, fmt: str) -> tuple[bool, float | None]:
@@ -416,6 +501,15 @@ def run_mixed(
     """
     numerical   = [t for t in tasks if t.get("format") in _ESTIMATHON_FORMATS]
     categorical = [t for t in tasks if t.get("format") not in _ESTIMATHON_FORMATS]
+
+    if len(numerical) > _MAX_ESTIMATHON_PROBLEMS:
+        print(
+            f"[run_mixed] {len(numerical)} numerical tasks found — "
+            f"capping Estimathon at {_MAX_ESTIMATHON_PROBLEMS} "
+            f"(all problems must fit in one context window). "
+            f"Use --limit to control this."
+        )
+        numerical = numerical[:_MAX_ESTIMATHON_PROBLEMS]
 
     estimathon_result: dict | None = None
     one_shot_result:   dict | None = None

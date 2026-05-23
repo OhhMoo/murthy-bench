@@ -45,7 +45,7 @@ After each slip the model also sees:
 - Remaining slips in the shared budget
 - A warning if it replaced a previously GOOD interval with a BAD one
 
-**Shared budget**: One pool of slips across all N problems (default `floor(1.38 × N)`, matching the real Estimathon's 18-slip / 13-problem ratio). The model must decide how to allocate: spend more slips refining a hard problem, or lock in an answer early and move on.
+**Shared budget**: One pool of slips across all N problems (default `floor(18/13 × N)`, matching the real Estimathon's 18-slip / 13-problem ratio). The model must decide how to allocate: spend more slips refining a hard problem, or lock in an answer early and move on.
 
 ---
 
@@ -192,5 +192,5 @@ Minimum 50 instances per task. Budget fixed at 5 rounds per task (or shared pool
 | Refinement accuracy | Fraction of voluntary bets on GOOD intervals that succeeded | Higher better |
 | Budget used | `slips_used / total_budget` | Lower better |
 
-**Default budget**: `floor(1.38 × N)` slips for N problems (e.g. 10 slips for 7 problems).  
+**Default budget**: `floor(18/13 × N)` slips for N problems (e.g. 10 slips for 7 problems).  
 **Baseline**: a random-interval agent achieves ~50% refinement accuracy and high width factors — any well-calibrated model should beat both.
