@@ -23,6 +23,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.table import Table
 
 from benchmark import config as cfg
+from benchmark.chat import run_chat
 from benchmark.client import ModelClient
 from benchmark.loader import load_tasks
 from benchmark.results import ResultWriter
@@ -314,6 +315,26 @@ def config_list():
         table.add_row(k, display)
 
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# longevity chat
+# ---------------------------------------------------------------------------
+
+@app.command()
+def chat(
+    model: str = typer.Option("claude-sonnet-4-6", "--model", "-m", help="Claude model to power the chat"),
+    api_key: Optional[str] = typer.Option(None, "--api-key", "-k", help="Anthropic API key (overrides config)"),
+):
+    """Interactive chat assistant — load datasets, run benchmarks, check models."""
+    run_chat(chat_model=model, api_key=api_key)
+
+
+# Default: open chat when no subcommand given
+@app.callback(invoke_without_command=True)
+def _default(ctx: typer.Context):
+    if ctx.invoked_subcommand is None:
+        run_chat()
 
 
 # ---------------------------------------------------------------------------

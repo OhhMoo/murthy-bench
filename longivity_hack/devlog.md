@@ -128,4 +128,44 @@ no HuggingFace token, no dataset download, no endpoint dependency.
 
 ---
 
+## 2026-05-23 — MURPHY banner, bamboo green palette, slash command fix
+
+### MURPHY banner
+
+Replaced the "LONGEVITY" ASCII art banner with "MURPHY" using the same block-character style.
+Six rows, one per gradient color, built with Rich `Text.append(row, style=color)`.
+
+### Bamboo green color scheme
+
+Changed the gradient from pure forest green (`rgb(0,70,0)` → `rgb(90,255,135)`) to a
+bamboo yellow-green spectrum:
+
+```
+rgb(45,80,25)    — deep bamboo forest (row 1)
+rgb(70,110,40)   — mature stalk (row 2)
+rgb(100,145,55)  — mid bamboo (row 3)
+rgb(135,175,70)  — light stalk (row 4)
+rgb(165,200,85)  — young bamboo (row 5)
+rgb(195,225,100) — shoot tip (row 6)
+```
+
+The panel borders and titles use mid-bamboo `rgb(100,145,55)` for borders and shoot-tip
+`rgb(195,225,100)` for titles. The thinking spinner and prompt `>` use `rgb(160,200,80)`.
+
+### Slash command fix
+
+**Root cause:** `Prompt.ask` from Rich does not always flush `sys.stdout` before blocking on
+`input()`, causing the prompt to be invisible on some Windows terminals. Also, `shlex.split`
+uses POSIX quoting rules, which can mangle paths containing Windows backslashes.
+
+**Fix:** Replaced `Prompt.ask` with `console.print(prompt, end="")` + `input()`. This uses
+the native Python `input()` with Rich handling the colored prompt line separately.
+Replaced `shlex.split` with a plain `user_input.split()` — sufficient for all slash commands
+since none of their arguments contain spaces. Wrapped the dispatch in `try/except` so a bad
+slash command doesn't crash the loop; `SystemExit` (from `/exit`) is re-raised.
+
+### Files modified
+- `benchmark/chat.py`: `_GRADIENT`, `_print_welcome`, `_help_panel`, `_thinking`, `run_chat`
+- `devlog.md` (this file)
+
 ---
