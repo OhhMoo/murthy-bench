@@ -59,3 +59,73 @@ hurt the Retrieval Resistance score. Decided to target AnAge and DrugAge instead
 - Implement trace scorer (Area 3) once first results.jsonl is collected
 
 ---
+
+## 2026-05-23 — Estimathon redesign + standalone mode
+
+### Corrections from real Estimathon rules
+
+Read the official Estimathon rules PDF. Our initial implementation had three bugs:
+
+**Scoring formula was wrong.** We had `2^(# misses)` as the exponent. Correct formula:
+```
+(10 + Σ floor(max/min) for GOOD final answers) × 2^(N − # good final answers)
+```
+The exponent is `N − # good`, not `# misses`. These only match if every problem has exactly
+one submission — they diverge with re-submissions.
+
+**Only last submission counts — we missed this entirely.** The real game: if you have a good
+interval and your refinement misses, you lose that problem. Every re-submission is a bet.
+Our previous implementation tracked any correct round; the correct logic tracks only the
+final state of each problem.
+
+**Budget is shared across all problems.** 18 slips for 13 problems in the original; we now
+default to `floor(1.38 × N)` to match this ratio. Previously we used per-problem budgets.
+
+### Feedback redesign
+
+Changed from directional ("too high / too low") to binary-only ("GOOD / BAD").
+Directional hints let a model converge mechanically without biological reasoning — just shift
+bounds in the indicated direction. Binary-only feedback forces the model to use its domain
+knowledge to infer direction after a miss. This is a purer test of biological understanding.
+
+Model now sees after each slip:
+- Good/bad result
+- Score before → score after (with ↓/↑ indicator)
+- Live standings table for all problems
+- Remaining slips in total budget
+- Warning if a refinement replaced a previously good interval
+
+### Key inference signal: refinement accuracy
+
+After a confirmed "good" interval, any re-submission is a bet. We now track:
+- `refinement_attempts`: how many times the model bet on improving a good interval
+- `refinement_successes`: how many bets paid off
+- `refinement_accuracy`: success rate
+
+A biologically-informed model only bets when its internal reasoning is confident. Random
+guessing after binary-only feedback succeeds ~50% of the time. Significantly above 50%
+indicates the model is genuinely reasoning about the biology to infer direction.
+
+### Standalone mode (no HuggingFace required)
+
+Added `--tasks sample` with 7 built-in tasks sourced from real published data:
+- 5 × multispecies lifespan (AnAge): bowhead whale (211y), naked mole rat (32y),
+  little brown bat (34y), European hedgehog (16y), common lab mouse
+- 2 × drug lifespan extension (DrugAge): rapamycin in mice (+14%), caloric restriction (+40%)
+- 1 × clinical biological age (NHANES-style): biomarker panel → 57y
+
+Gold values are all verifiable from primary literature. Tasks cover three distinct domains
+to test breadth of biological knowledge.
+
+The CLI now runs entirely through `--provider anthropic` with `--tasks sample`:
+no HuggingFace token, no dataset download, no endpoint dependency.
+
+### Files modified
+- `benchmark/runner.py`: full rewrite — `EstimathonSession`, `run_estimathon()`, binary feedback
+- `benchmark/loader.py`: added `_SAMPLE_TASKS` + `sample` keyword
+- `cli.py`: wired estimathon mode, live slip-by-slip console output, refinement summary panel
+- `README.md`: rewritten around Claude/standalone workflow
+
+---
+
+---

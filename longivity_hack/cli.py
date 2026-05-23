@@ -26,7 +26,7 @@ from benchmark import config as cfg
 from benchmark.client import ModelClient
 from benchmark.loader import load_tasks
 from benchmark.results import ResultWriter
-from benchmark.runner import run_eval
+from benchmark.runner import run_eval, run_estimathon
 
 app = typer.Typer(
     name="longevity",
@@ -48,7 +48,7 @@ class Provider(str, Enum):
 
 class EvalMode(str, Enum):
     one_shot = "one-shot"
-    iterative = "iterative"
+    estimathon = "estimathon"
 
 
 # ---------------------------------------------------------------------------
@@ -57,138 +57,149 @@ class EvalMode(str, Enum):
 
 @app.command()
 def run(
-    model: str = typer.Option(..., "--model", "-m", help="Model ID or name (e.g. meta-llama/Meta-Llama-3-8B-Instruct)"),
+    model: str = typer.Option(..., "--model", "-m", help="Model ID or name"),
     provider: Provider = typer.Option(Provider.hf, "--provider", "-p", help="Model provider"),
     api_key: Optional[str] = typer.Option(None, "--api-key", "-k", help="API key (overrides config/env)"),
     endpoint: Optional[str] = typer.Option(None, "--endpoint", "-e", help="Custom base URL (for provider=endpoint)"),
     tasks: str = typer.Option("longebench", "--tasks", "-t", help='"longebench", "longebench:extra", or path to .jsonl'),
-    mode: EvalMode = typer.Option(EvalMode.one_shot, "--mode", help="Evaluation mode"),
+    mode: EvalMode = typer.Option(EvalMode.one_shot, "--mode", help="one-shot | estimathon"),
     output: Path = typer.Option(Path("results.jsonl"), "--output", "-o", help="Output file path"),
-    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=8, help="Parallel requests (max 8)"),
-    budget: int = typer.Option(5, "--budget", "-b", help="Feedback rounds per task (iterative mode)"),
-    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Cap number of tasks (for dry-runs)"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=8, help="Parallel requests for one-shot (max 8)"),
+    budget: Optional[int] = typer.Option(None, "--budget", "-b", help="Total slips for estimathon (default: auto ~1.38×N)"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Cap number of tasks"),
     think: bool = typer.Option(False, "--think/--no-think", help="Enable chain-of-thought traces"),
 ):
     """Run the benchmark against a model and collect results."""
     resolved_key = api_key or cfg.provider_api_key(provider.value)
-
-    # Credentials check
     if provider != Provider.endpoint:
         err = cfg.provider_preflight(provider.value, api_key)
         if err:
             console.print(f"[red]Error:[/red] {err}")
             raise typer.Exit(1)
-    elif not resolved_key and provider == Provider.endpoint:
-        # endpoint provider can work without a key (some local servers don't require one)
-        resolved_key = resolved_key or "none"
+    resolved_key = resolved_key or "none"
 
     client = ModelClient(
         provider=provider.value,
         model_id=model,
-        api_key=resolved_key or "none",
+        api_key=resolved_key,
         endpoint_url=endpoint,
     )
 
     console.print(
         Panel(
             f"[bold]Model:[/bold] {model}\n"
-            f"[bold]Provider:[/bold] {provider.value}\n"
-            f"[bold]Tasks:[/bold] {tasks}  [bold]Mode:[/bold] {mode.value}\n"
-            f"[bold]Concurrency:[/bold] {concurrency}  [bold]Budget:[/bold] {budget}  [bold]Think:[/bold] {think}",
+            f"[bold]Provider:[/bold] {provider.value}  "
+            f"[bold]Mode:[/bold] {mode.value}  "
+            f"[bold]Think:[/bold] {think}\n"
+            f"[bold]Tasks:[/bold] {tasks}" + (f"  [bold]Limit:[/bold] {limit}" if limit else ""),
             title="[bold green]Longevity Benchmark Run[/bold green]",
             expand=False,
         )
     )
 
     try:
-        task_iter = load_tasks(tasks, limit=limit)
+        task_list = list(load_tasks(tasks, limit=limit))
     except (FileNotFoundError, ImportError) as exc:
         console.print(f"[red]Error loading tasks:[/red] {exc}")
         raise typer.Exit(1)
 
-    completed = 0
-    errors = 0
-    correct_count = 0
-
-    summary_table = Table(title="Results", show_lines=False)
-    summary_table.add_column("lb_id", style="cyan", no_wrap=True)
-    summary_table.add_column("domain")
-    summary_table.add_column("gold", justify="right")
-    summary_table.add_column("pred / score", justify="right")
-    summary_table.add_column("status", justify="center")
+    console.print(f"Loaded [bold]{len(task_list)}[/bold] tasks.")
 
     with ResultWriter(str(output)) as writer:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-            transient=True,
-        ) as progress:
-            task_bar = progress.add_task("Running...", total=None)
+
+        # ------------------------------------------------------------------
+        # Estimathon mode — single multi-turn session, shared budget
+        # ------------------------------------------------------------------
+        if mode == EvalMode.estimathon:
+            slip_count = 0
+
+            def on_slip(record: dict):
+                nonlocal slip_count
+                slip_count += 1
+                good = record.get("good", False)
+                wf = record.get("width_factor")
+                score_before = record["score_before"]
+                score_after = record["score_after"]
+                direction = "↓" if score_after < score_before else ("↑" if score_after > score_before else "=")
+                console.print(
+                    f"  Slip {record['slip']:2d}  "
+                    f"[cyan]{record['pid']}[/cyan]  "
+                    f"[{'green' if good else 'red'}]{'GOOD' if good else 'BAD '}[/]"
+                    + (f"  width={wf}" if wf is not None else "")
+                    + f"  score {score_before} {direction} {score_after}"
+                    + (f"  [yellow]⚠ lost good interval[/yellow]" if record.get("prev_was_good") and not good else "")
+                )
+
+            session_result = run_estimathon(
+                tasks=task_list,
+                client=client,
+                total_budget=budget,
+                enable_thinking=think,
+                on_slip=on_slip,
+            )
+            writer.write(session_result)
+
+            ref_acc = session_result.get("refinement_accuracy")
+            ref_str = f"{ref_acc:.0%}" if ref_acc is not None else "n/a"
+            console.print(
+                Panel(
+                    f"Final score:  [bold]{session_result['final_score']}[/bold]  (lower is better)\n"
+                    f"Problems solved:  {session_result['n_good_final']} / {session_result['n_problems']}\n"
+                    f"Slips used:  {session_result['slips_used']} / {session_result['total_budget']}\n"
+                    f"Refinement accuracy:  {ref_str}  "
+                    f"({session_result['refinement_successes']}/{session_result['refinement_attempts']} bets won)",
+                    title="[bold]Session Summary[/bold]",
+                    expand=False,
+                )
+            )
+
+        # ------------------------------------------------------------------
+        # One-shot mode — parallel, one request per task
+        # ------------------------------------------------------------------
+        else:
+            completed = 0
+            correct_count = 0
+
+            summary_table = Table(show_lines=False)
+            summary_table.add_column("lb_id", style="cyan", no_wrap=True)
+            summary_table.add_column("domain")
+            summary_table.add_column("gold", justify="right")
+            summary_table.add_column("pred", justify="right")
+            summary_table.add_column("", justify="center")
 
             def on_result(record: dict):
-                nonlocal completed, errors, correct_count
+                nonlocal completed, correct_count
                 writer.write(record)
                 completed += 1
-
-                if "error" in record:
-                    errors += 1
-                    status = "[red]ERROR[/red]"
-                    pred_str = record["error"][:30]
-                elif mode == EvalMode.iterative:
-                    score = record.get("task_score", "?")
-                    rtc = record.get("rounds_to_correct")
-                    status = "[green]OK[/green]" if rtc is not None else "[yellow]MISS[/yellow]"
-                    pred_str = f"score={score}"
-                else:
-                    correct = record.get("correct", False)
-                    if correct:
-                        correct_count += 1
-                    status = "[green]✓[/green]" if correct else "[red]✗[/red]"
-                    pred_str = (record.get("pred") or "")[:20]
-
+                correct = record.get("correct", False)
+                if correct:
+                    correct_count += 1
                 summary_table.add_row(
                     record.get("lb_id", ""),
                     record.get("domain", ""),
-                    str(record.get("gold", "")),
-                    pred_str,
-                    status,
+                    str(record.get("gold", ""))[:12],
+                    (record.get("pred") or "")[:20],
+                    "[green]✓[/green]" if correct else "[red]✗[/red]",
                 )
-                progress.update(task_bar, advance=1, description=f"Done {completed}")
 
             run_eval(
-                tasks=load_tasks(tasks, limit=limit),
+                tasks=iter(task_list),
                 client=client,
-                mode=mode.value,
-                budget=budget,
                 concurrency=concurrency,
                 enable_thinking=think,
                 on_result=on_result,
             )
 
-    console.print(summary_table)
-
-    if mode == EvalMode.one_shot:
-        acc = correct_count / completed if completed else 0
-        console.print(
-            Panel(
-                f"Tasks: {completed}  Correct: {correct_count}  Errors: {errors}\n"
-                f"Accuracy: [bold]{acc:.1%}[/bold]",
-                title="[bold]Summary[/bold]",
-                expand=False,
+            console.print(summary_table)
+            acc = correct_count / completed if completed else 0
+            console.print(
+                Panel(
+                    f"Tasks: {completed}  Correct: {correct_count}\n"
+                    f"Accuracy: [bold]{acc:.1%}[/bold]",
+                    title="[bold]Summary[/bold]",
+                    expand=False,
+                )
             )
-        )
-    else:
-        console.print(
-            Panel(
-                f"Tasks: {completed}  Errors: {errors}\n"
-                f"Results written to [bold]{output}[/bold]",
-                title="[bold]Summary[/bold]",
-                expand=False,
-            )
-        )
 
     console.print(f"\n[dim]Results saved → {output}[/dim]")
 
