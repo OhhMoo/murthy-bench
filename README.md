@@ -7,6 +7,16 @@ Non-numerical tasks (binary, multiclass, ternary, generation) are scored with st
 
 ---
 
+## Screenshots
+
+![Interactive chat](pictures/convo.jpg)
+
+![HuggingFace model browser](pictures/HF.jpg)
+
+![CLI benchmark run](pictures/CLI.jpg)
+
+---
+
 ## Install
 
 ```bash
