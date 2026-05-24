@@ -10,12 +10,15 @@ _DEFAULTS: dict = {
     "anthropic.api_key": None,
     "eval.concurrency": 4,
     "eval.budget": 5,
+    "llm.endpoint": None,
+    "llm.model": "longevity-llm",
 }
 
 _ENV_OVERRIDES: dict = {
     "hf.token": "HF_TOKEN",
     "openai.api_key": "OPENAI_API_KEY",
     "anthropic.api_key": "ANTHROPIC_API_KEY",
+    "llm.endpoint": "L_LLM_ENDPOINT",
 }
 
 _PROVIDER_KEY_MAP: dict = {
@@ -74,6 +77,28 @@ def provider_api_key(provider: str) -> str | None:
     if config_key is None:
         return None
     return get(config_key)
+
+
+def get_groups() -> dict:
+    return _load_file().get("groups", {})
+
+
+def get_group(name: str) -> list[dict] | None:
+    return get_groups().get(name)
+
+
+def set_group(name: str, entries: list[dict]) -> None:
+    data = _load_file()
+    data.setdefault("groups", {})[name] = entries
+    _save_file(data)
+
+
+def remove_group(name: str) -> bool:
+    data = _load_file()
+    existed = name in data.get("groups", {})
+    data.get("groups", {}).pop(name, None)
+    _save_file(data)
+    return existed
 
 
 def provider_preflight(provider: str, api_key: str | None = None) -> str | None:

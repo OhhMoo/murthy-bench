@@ -423,7 +423,7 @@ def _load_jsonl(path: str, limit: int | None) -> list[dict]:
 
     tasks = []
     count = 0
-    with p.open() as f:
+    with p.open(encoding="utf-8") as f:
         for line in f:
             if limit is not None and count >= limit:
                 break

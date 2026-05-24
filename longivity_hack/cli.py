@@ -29,7 +29,7 @@ try:
     from .benchmark.client import ModelClient
     from .benchmark.loader import load_tasks
     from .benchmark.results import ResultWriter
-    from .benchmark.runner import run_eval, run_estimathon, run_mixed, _fmt_score
+    from .benchmark.runner import run_eval, run_estimathon, run_mixed, _fmt_score, _ESTIMATHON_FORMATS
 except ImportError:
     # local dev: python cli.py from inside longivity_hack/
     from benchmark import config as cfg
@@ -37,7 +37,7 @@ except ImportError:
     from benchmark.client import ModelClient
     from benchmark.loader import load_tasks
     from benchmark.results import ResultWriter
-    from benchmark.runner import run_eval, run_estimathon, run_mixed, _fmt_score
+    from benchmark.runner import run_eval, run_estimathon, run_mixed, _fmt_score, _ESTIMATHON_FORMATS
 
 app = typer.Typer(
     name="longevity",
@@ -45,7 +45,9 @@ app = typer.Typer(
     add_completion=False,
 )
 config_app = typer.Typer(help="Manage stored configuration values.")
+group_app = typer.Typer(help="Manage named model comparison groups.")
 app.add_typer(config_app, name="config")
+app.add_typer(group_app, name="group")
 
 console = Console()
 
@@ -80,8 +82,16 @@ def run(
     budget: Optional[int] = typer.Option(None, "--budget", "-b", help="Total slips for estimathon (default: auto floor(18/13 × N))"),
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Cap number of tasks"),
     think: bool = typer.Option(False, "--think/--no-think", help="Enable chain-of-thought traces"),
+    extract: bool = typer.Option(False, "--extract/--no-extract", help="Use Claude to reformat verbose model outputs into required answer format"),
 ):
     """Run the benchmark against a model and collect results."""
+    # Auto-resolve L-LLM endpoint and HF token from config if not supplied
+    if model == "longevity-llm":
+        if not endpoint:
+            endpoint = cfg.get("llm.endpoint")
+        if not api_key:
+            api_key = cfg.get("hf.token")
+
     resolved_key = api_key or cfg.provider_api_key(provider.value)
     if provider != Provider.endpoint:
         err = cfg.provider_preflight(provider.value, api_key)
@@ -96,6 +106,19 @@ def run(
         api_key=resolved_key,
         endpoint_url=endpoint,
     )
+
+    extractor_client = None
+    if extract:
+        ant_key = cfg.get("anthropic.api_key")
+        if not ant_key:
+            console.print("[yellow]Warning:[/yellow] --extract requires anthropic.api_key in config. Extraction disabled.")
+        else:
+            extractor_client = ModelClient(
+                provider="anthropic",
+                model_id="claude-haiku-4-5-20251001",
+                api_key=ant_key,
+            )
+            console.print("  [dim]Extraction layer: Claude Haiku will reformat verbose outputs[/dim]")
 
     console.print(
         Panel(
@@ -124,7 +147,6 @@ def run(
     if mode == EvalMode.estimathon and tasks.startswith("longebench"):
         console.print("  [dim]Filtered to regression-compatible tasks (interval format)[/dim]")
     if mode == EvalMode.mixed:
-        from benchmark.runner import _ESTIMATHON_FORMATS
         n_num = sum(1 for t in task_list if t.get("format") in _ESTIMATHON_FORMATS)
         n_cat = len(task_list) - n_num
         console.print(f"  [dim]Track 1 (Estimathon): {n_num} numerical  ·  Track 2 (one-shot): {n_cat} categorical[/dim]")
@@ -165,6 +187,7 @@ def run(
                 client=client,
                 total_budget=budget,
                 enable_thinking=think,
+                extractor=extractor_client,
                 on_slip=on_slip,
             )
             writer.write(session_result)
@@ -231,6 +254,7 @@ def run(
                 total_budget=budget,
                 concurrency=concurrency,
                 enable_thinking=think,
+                extractor=extractor_client,
                 on_slip=on_slip_mixed,
                 on_result=on_result_mixed,
             )
@@ -298,6 +322,7 @@ def run(
                 client=client,
                 concurrency=concurrency,
                 enable_thinking=think,
+                extractor=extractor_client,
                 on_result=on_result,
             )
 
@@ -327,6 +352,11 @@ def status(
     endpoint: Optional[str] = typer.Option(None, "--endpoint", "-e"),
 ):
     """Check connectivity and latency to a model endpoint."""
+    if model == "longevity-llm":
+        if not endpoint:
+            endpoint = cfg.get("llm.endpoint")
+        if not api_key:
+            api_key = cfg.get("hf.token")
     resolved_key = api_key or cfg.provider_api_key(provider.value) or "none"
     client = ModelClient(
         provider=provider.value,
@@ -425,6 +455,209 @@ def config_list():
         table.add_row(k, display)
 
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# longevity group
+# ---------------------------------------------------------------------------
+
+@group_app.command("add")
+def group_add(
+    name: str = typer.Argument(..., help="Group name"),
+    entries: list[str] = typer.Argument(
+        ..., help='One or more entries as "label:model:provider"'
+    ),
+):
+    """Create or replace a named model group.
+
+    Example:
+      longevity group add longevity \\
+        "L-LLM:longevity-llm:endpoint" \\
+        "Claude:claude-sonnet-4-6:anthropic" \\
+        "Qwen3-8B:Qwen/Qwen3-8B-Instruct:hf"
+    """
+    parsed: list[dict] = []
+    for raw in entries:
+        parts = raw.split(":", 2)
+        if len(parts) != 3:
+            console.print(f"[red]Bad entry[/red] {raw!r} — expected label:model:provider")
+            raise typer.Exit(1)
+        label, model_id, prov = parts
+        if prov not in ("hf", "openai", "anthropic", "endpoint"):
+            console.print(f"[red]Unknown provider[/red] {prov!r}. Use: hf | openai | anthropic | endpoint")
+            raise typer.Exit(1)
+        parsed.append({"label": label, "model": model_id, "provider": prov})
+    cfg.set_group(name, parsed)
+    console.print(f"[green]Saved group[/green] [bold]{name}[/bold] ({len(parsed)} models)")
+
+
+@group_app.command("list")
+def group_list():
+    """List all saved group names."""
+    groups = cfg.get_groups()
+    if not groups:
+        console.print("[dim]No groups saved. Use: longevity group add <name> ...[/dim]")
+        return
+    table = Table(title="Saved Groups")
+    table.add_column("Name", style="cyan")
+    table.add_column("Models", justify="right")
+    for gname, entries in sorted(groups.items()):
+        table.add_row(gname, str(len(entries)))
+    console.print(table)
+
+
+@group_app.command("show")
+def group_show(
+    name: str = typer.Argument(..., help="Group name to inspect"),
+):
+    """Show all models in a group."""
+    entries = cfg.get_group(name)
+    if entries is None:
+        console.print(f"[red]Group {name!r} not found.[/red]")
+        raise typer.Exit(1)
+    table = Table(title=f"Group: {name}")
+    table.add_column("Label", style="cyan")
+    table.add_column("Model")
+    table.add_column("Provider")
+    for e in entries:
+        table.add_row(e["label"], e["model"], e["provider"])
+    console.print(table)
+
+
+@group_app.command("remove")
+def group_remove(
+    name: str = typer.Argument(..., help="Group name to delete"),
+):
+    """Delete a saved group."""
+    if cfg.remove_group(name):
+        console.print(f"[green]Removed group[/green] [bold]{name}[/bold]")
+    else:
+        console.print(f"[yellow]Group {name!r} not found.[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# longevity compare
+# ---------------------------------------------------------------------------
+
+@app.command()
+def compare(
+    group: str = typer.Option(..., "--group", "-g", help="Named model group to compare"),
+    tasks: str = typer.Option("longebench", "--tasks", "-t", help='"longebench", "longebench:extra", or path to .jsonl'),
+    mode: EvalMode = typer.Option(EvalMode.one_shot, "--mode", help="one-shot | mixed"),
+    output: Path = typer.Option(Path("compare_results.jsonl"), "--output", "-o"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=8),
+    budget: Optional[int] = typer.Option(None, "--budget", "-b", help="Estimathon slip budget (default: auto floor(18/13 × N))"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-l"),
+    think: bool = typer.Option(False, "--think/--no-think"),
+):
+    """Run benchmark tasks against every model in a group and print a comparison table."""
+    entries = cfg.get_group(group)
+    if not entries:
+        console.print(f"[red]Group {group!r} not found.[/red] Use: longevity group add {group} ...")
+        raise typer.Exit(1)
+
+    try:
+        task_list = load_tasks(tasks, limit=limit)
+    except (FileNotFoundError, ImportError) as exc:
+        console.print(f"[red]Error loading tasks:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(
+        Panel(
+            f"[bold]Group:[/bold] {group}  ({len(entries)} models)\n"
+            f"[bold]Tasks:[/bold] {tasks}  ({len(task_list)} loaded)\n"
+            f"[bold]Mode:[/bold] {mode.value}  [bold]Think:[/bold] {think}",
+            title="[bold green]Longevity Compare[/bold green]",
+            expand=False,
+        )
+    )
+
+    summary_rows: list[tuple] = []
+
+    with ResultWriter(str(output)) as writer:
+        for entry in entries:
+            label = entry["label"]
+            model_id = entry["model"]
+            prov = entry["provider"]
+
+            # Resolve endpoint for L-LLM shorthand
+            ep_url: str | None = entry.get("endpoint")
+            if prov == "endpoint" and not ep_url:
+                ep_url = cfg.get("llm.endpoint")
+
+            api_key = cfg.provider_api_key(prov) or "none"
+            client = ModelClient(
+                provider=prov,
+                model_id=model_id,
+                api_key=api_key,
+                endpoint_url=ep_url,
+            )
+
+            console.print(f"\n[bold cyan]{label}[/bold cyan] — {model_id} via {prov}")
+
+            n_correct = 0
+            n_tasks = 0
+            total_tokens = 0
+
+            def _on_result(record: dict):
+                nonlocal n_correct, n_tasks, total_tokens
+                record["model_label"] = label
+                writer.write(record)
+                n_tasks += 1
+                if record.get("correct"):
+                    n_correct += 1
+                total_tokens += record.get("tokens_used", 0)
+
+            with Progress(
+                SpinnerColumn(), TextColumn("{task.description}"),
+                BarColumn(), TaskProgressColumn(),
+                console=console, transient=True,
+            ) as prog:
+                ptask = prog.add_task(f"Evaluating {label}...", total=len(task_list))
+
+                def _on_result_tracked(record: dict, _ptask=ptask):
+                    _on_result(record)
+                    prog.advance(_ptask)
+
+                if mode == EvalMode.mixed:
+                    mixed_result = run_mixed(
+                        tasks=task_list,
+                        client=client,
+                        total_budget=budget,
+                        concurrency=concurrency,
+                        enable_thinking=think,
+                        on_result=_on_result_tracked,
+                    )
+                    mixed_result["model_label"] = label
+                    writer.write(mixed_result)
+                else:
+                    run_eval(
+                        tasks=iter(task_list),
+                        client=client,
+                        concurrency=concurrency,
+                        enable_thinking=think,
+                        on_result=_on_result_tracked,
+                    )
+
+            avg_tok = total_tokens // n_tasks if n_tasks else 0
+            acc = n_correct / n_tasks if n_tasks else 0.0
+            summary_rows.append((label, n_tasks, n_correct, acc, avg_tok))
+            console.print(
+                f"  {label}: {n_correct}/{n_tasks} correct  ({acc:.1%})  avg {avg_tok} tok"
+            )
+
+    # Final comparison table
+    table = Table(title="[bold]Comparison Summary[/bold]", show_lines=True)
+    table.add_column("Model", style="cyan")
+    table.add_column("Tasks", justify="right")
+    table.add_column("Correct", justify="right")
+    table.add_column("Accuracy", justify="right", style="bold")
+    table.add_column("Avg Tokens", justify="right")
+    for label, n_tasks, n_correct, acc, avg_tok in summary_rows:
+        table.add_row(label, str(n_tasks), str(n_correct), f"{acc:.1%}", str(avg_tok))
+    console.print("\n")
+    console.print(table)
+    console.print(f"\n[dim]Full results → {output}[/dim]")
 
 
 # ---------------------------------------------------------------------------

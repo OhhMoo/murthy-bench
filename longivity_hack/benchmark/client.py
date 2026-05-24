@@ -88,8 +88,8 @@ class ModelClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
         if enable_thinking:
-            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
             kwargs["max_tokens"] = max(max_tokens, 3000)
 
         resp = client.chat.completions.create(**kwargs)

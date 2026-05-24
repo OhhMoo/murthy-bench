@@ -64,6 +64,7 @@ class EstimathonSession:
     golds: dict = field(default_factory=dict)              # pid → float
     slip_log: list = field(default_factory=list)
     per_problem_slips: dict = field(default_factory=dict)  # pid → attempt count
+    tried_intervals: dict = field(default_factory=dict)    # pid → list of (min, max) that scored BAD
 
     @property
     def n_problems(self) -> int:
@@ -98,6 +99,8 @@ class EstimathonSession:
         self.last_submissions[pid] = (pmin, pmax)
         score_after = self.current_score()
         self.slips_used += 1
+        if not good:
+            self.tried_intervals.setdefault(pid, []).append((pmin, pmax))
 
         record = {
             "slip": self.slips_used,
@@ -149,12 +152,26 @@ Rules:
 Scoring formula (lower is better):
   (10 + sum of floor(max/min) for all GOOD final intervals) × 2^({n_problems} − number of GOOD final answers)
 
-Strategy:
-- Wide intervals are safe but expensive (high floor(max/min)).
-- Narrow intervals score better but risk being wrong.
-- Unsolved problems double your score — cover all {n_problems} problems first.
-- You receive ONLY binary feedback: GOOD or BAD. No direction hints.
-- Spread your slips across problems — do not waste all slips on one problem.
+CRITICAL STRATEGY — read this carefully:
+
+Outcome priority (best → worst):
+  1. GOOD & narrow  → ideal: correct answer, small max/min ratio
+  2. GOOD & wide    → safe:  correct answer, large ratio — still FAR better than any BAD
+  3. BAD  & wide    → bad:   wrong — your ENTIRE score doubles
+  4. BAD  & narrow  → worst: wrong AND you wasted precision — score still doubles
+
+Every unsolved problem doubles your entire score.
+A correct wide interval is ALWAYS better than a wrong narrow one.
+
+Optimal play:
+  Step 1 — Secure GOOD first: submit a WIDE interval to guarantee correctness.
+           When uncertain, start very wide: e.g. [1, 1000] or [10, 100000].
+  Step 2 — Narrow only when confident: use remaining slips to tighten the interval.
+           Only submit a narrow interval if you are sure it contains the answer.
+  Step 3 — Cover all problems: spread slips across problems before refining any one.
+
+You receive ONLY binary feedback: GOOD or BAD. No directional hints.
+Never start narrow — a missed narrow guess costs a doubled score AND burns a slip.
 
 OUTPUT FORMAT — THIS IS MANDATORY:
 Your entire response must be ONLY these two lines. No explanation. No reasoning. No other text.
@@ -195,6 +212,8 @@ def _build_initial_user_message(session: EstimathonSession) -> str:
         f"\nStarting score: {_fmt_score(session.current_score())}  "
         f"(all {session.n_problems} problems unsolved)\n"
         f"Slips remaining: {session.total_budget}\n\n"
+        "REMINDER: Start each problem with a WIDE interval to secure GOOD first.\n"
+        "A correct wide answer is always better than a wrong narrow one.\n\n"
         "Submit your first interval:\n"
         "PROBLEM <number>\n"
         "INTERVAL [min, max]"
@@ -204,7 +223,13 @@ def _build_initial_user_message(session: EstimathonSession) -> str:
 
 def _build_feedback(result: dict, session: EstimathonSession) -> str:
     good_str = "GOOD" if result["good"] else "BAD"
-    width_note = f"  Width factor: {result['width_factor']}." if result["good"] else ""
+    if result["good"]:
+        wf = result["width_factor"]
+        width_note = f"  Width factor: {wf}."
+        if wf and wf > 2:
+            width_note += " You may narrow this interval to improve your score — only if confident."
+    else:
+        width_note = ""
 
     warning = ""
     if result["was_refinement"] and result["prev_was_good"] and not result["good"]:
@@ -239,8 +264,19 @@ def _build_feedback(result: dict, session: EstimathonSession) -> str:
             "INTERVAL [min, max]"
         )
 
+    pid = result["pid"]
+    wrong_history = session.tried_intervals.get(pid, [])
+    wrong_note = ""
+    if wrong_history and not result["good"]:
+        wrong_note = (
+            f"Wrong intervals tried so far for Problem {pid}: "
+            + ", ".join(f"[{a}, {b}]" for a, b in wrong_history)
+            + " — none of these contained the answer.\n"
+        )
+
     return (
-        f"Problem [{result['pid']}]: {good_str}.{width_note}{warning}\n"
+        f"Problem [{pid}]: {good_str}.{width_note}{warning}\n"
+        f"{wrong_note}"
         f"{attempt_note}\n"
         f"{score_line}\n\n"
         f"Standings:\n{standings}\n\n"
@@ -265,12 +301,14 @@ def run_estimathon(
     client: ModelClient,
     total_budget: int | None = None,
     enable_thinking: bool = False,
+    extractor: "ModelClient | None" = None,
     on_slip: Callable[[dict], None] | None = None,
 ) -> dict:
     """
     Run a full Estimathon session: shared budget, binary feedback, last-submission-counts.
 
     total_budget defaults to floor(18/13 × n_problems) matching the real Estimathon ratio.
+    extractor: optional secondary ModelClient (e.g. Claude) used to parse verbose responses.
     """
     n = len(tasks)
     if total_budget is None:
@@ -296,7 +334,7 @@ def run_estimathon(
         try:
             resp = client.chat(
                 conversation,
-                max_tokens=3000 if enable_thinking else 600,
+                max_tokens=3000 if enable_thinking else 120,
                 temperature=0.0,
                 enable_thinking=enable_thinking,
             )
@@ -318,6 +356,17 @@ def run_estimathon(
             break
 
         problem_num, pmin, pmax = _parse_estimathon_response(resp.answer)
+
+        if problem_num is None or pmin is None:
+            # Try Claude extractor before giving up / nudging
+            if extractor is not None:
+                problem_summaries = "\n".join(
+                    f"Problem {i+1}: {t.get('lb_id','?')} ({t.get('domain','?')})"
+                    for i, t in enumerate(tasks)
+                )
+                problem_num, pmin, pmax = _extract_interval_from_verbose(
+                    resp.answer, problem_summaries, extractor
+                )
 
         if problem_num is None or pmin is None:
             parse_failures += 1
@@ -342,6 +391,23 @@ def run_estimathon(
             continue
 
         pid = f"P{problem_num}"
+
+        # Reject degenerate intervals (min == max can never contain a value).
+        if pmin == pmax:
+            conversation.append({"role": "assistant", "content": resp.answer})
+            conversation.append({
+                "role": "user",
+                "content": (
+                    f"INVALID: [{pmin}, {pmax}] — min and max cannot be equal.\n\n"
+                    f"Slips remaining: {session.slips_remaining}"
+                ),
+            })
+            continue
+
+        # Warn on identical repeat submissions but still process (burn the slip).
+        repeat_note = ""
+        if pid in session.last_submissions and session.last_submissions[pid] == (pmin, pmax):
+            repeat_note = f"NOTE: [{pmin}, {pmax}] for Problem {problem_num} was already submitted and scored BAD.\n"
 
         # Enforce per-problem attempt cap — reject without burning a slip.
         attempts_so_far = session.per_problem_slips.get(pid, 0)
@@ -373,7 +439,7 @@ def run_estimathon(
         if on_slip:
             on_slip(result)
 
-        feedback = _build_feedback(result, session)
+        feedback = repeat_note + _build_feedback(result, session)
         conversation.append({"role": "assistant", "content": resp.answer})
         conversation.append({"role": "user", "content": feedback})
 
@@ -408,6 +474,91 @@ def run_estimathon(
 # not numerical predictions. Only regression/interval have numeric gold values.
 _ESTIMATHON_FORMATS = {"regression", "interval"}
 
+_FORMAT_REMINDERS: dict[str, str] = {
+    "binary":     "\n\nReply with ONLY a single letter: A or B. No explanation. No other text.",
+    "pairwise":   "\n\nReply with ONLY a single letter: A or B. No explanation. No other text.",
+    "multiclass": "\n\nReply with ONLY a single letter (A, B, C, D, or E). No explanation. No other text.",
+    "generation": "\n\nReply with ONLY a semicolon-separated list of gene symbols. No explanation. No other text.",
+    # ternary omitted — LongeBench ternary uses task-specific text labels (e.g. Same/Different/Unknown)
+}
+
+_FORMAT_VALID: dict[str, str] = {
+    "binary":     "A or B",
+    "ternary":    "A, B, or C",
+    "pairwise":   "A or B",
+    "multiclass": "A, B, C, D, or E",
+    "generation": "semicolon-separated gene symbols",
+}
+
+
+def _inject_format_reminder(messages: list[dict], fmt: str) -> list[dict]:
+    """Append a format reminder to the last user message if one exists for this format."""
+    reminder = _FORMAT_REMINDERS.get(fmt)
+    if not reminder:
+        return messages
+    out = [dict(m) for m in messages]
+    for i in range(len(out) - 1, -1, -1):
+        if out[i]["role"] == "user":
+            out[i] = {**out[i], "content": out[i]["content"] + reminder}
+            break
+    return out
+
+
+def _looks_like_answer(pred: str, fmt: str) -> bool:
+    """Return True if pred already matches the expected short-form answer."""
+    p = pred.strip().upper()
+    if fmt in ("binary", "pairwise"):
+        return p in ("A", "B")
+    if fmt == "ternary":
+        return p in ("A", "B", "C")
+    if fmt == "multiclass":
+        return p in ("A", "B", "C", "D", "E")
+    return True  # generation / unknown: skip extraction
+
+
+def _extract_answer(raw: str, fmt: str, extractor: "ModelClient") -> str:
+    """Ask the extractor model to pull the answer letter from a verbose response."""
+    valid = _FORMAT_VALID.get(fmt)
+    if not valid:
+        return raw
+    prompt = (
+        f"A language model gave this verbose response to a {fmt} classification question "
+        f"(valid answers: {valid}):\n\n"
+        f"<response>\n{raw[:3000]}\n</response>\n\n"
+        f"Extract the answer. Reply with ONLY the answer ({valid}). Nothing else."
+    )
+    try:
+        resp = extractor.chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=20,
+            temperature=0.0,
+        )
+        return resp.answer.strip()
+    except Exception:
+        return raw
+
+
+def _extract_interval_from_verbose(
+    raw: str, problem_summaries: str, extractor: "ModelClient"
+) -> tuple[int | None, float | None, float | None]:
+    """Ask the extractor to identify which problem and interval a verbose response addresses."""
+    prompt = (
+        "A model responded to an Estimathon problem with verbose text instead of the required format.\n\n"
+        f"Available problems:\n{problem_summaries}\n\n"
+        f"Model response:\n<response>\n{raw[:2000]}\n</response>\n\n"
+        "Which problem number is it addressing and what numeric interval does the text imply?\n"
+        "Reply with ONLY:\nPROBLEM <number>\nINTERVAL [min, max]"
+    )
+    try:
+        resp = extractor.chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=40,
+            temperature=0.0,
+        )
+        return _parse_estimathon_response(resp.answer)
+    except Exception:
+        return None, None, None
+
 
 def _score_task(pred: str, gold: str, fmt: str) -> tuple[bool, float | None]:
     """Format-aware scoring. Returns (correct, f1_or_None)."""
@@ -426,17 +577,25 @@ def _score_task(pred: str, gold: str, fmt: str) -> tuple[bool, float | None]:
         return exact, None
 
 
-def _run_one_shot(task: dict, client: ModelClient, enable_thinking: bool) -> dict:
+def _run_one_shot(
+    task: dict,
+    client: ModelClient,
+    enable_thinking: bool,
+    extractor: "ModelClient | None" = None,
+) -> dict:
     messages = task["messages"]
     gold = messages[-1]["content"].strip()
     fmt = task.get("format", "")
+    call_messages = _inject_format_reminder(messages[:-1], fmt)
     resp = client.chat(
-        messages[:-1],
-        max_tokens=500,
+        call_messages,
+        max_tokens=3000 if enable_thinking else 200,
         temperature=0.0,
         enable_thinking=enable_thinking,
     )
     pred = resp.answer.strip()
+    if extractor is not None and not _looks_like_answer(pred, fmt):
+        pred = _extract_answer(pred, fmt, extractor)
     correct, f1 = _score_task(pred, gold, fmt)
     result = {
         "lb_id": task.get("lb_id", ""),
@@ -460,6 +619,7 @@ def run_eval(
     client: ModelClient,
     concurrency: int = 4,
     enable_thinking: bool = False,
+    extractor: "ModelClient | None" = None,
     on_result: Callable[[dict], None] | None = None,
 ) -> list[dict]:
     concurrency = min(concurrency, _MAX_CONCURRENCY)
@@ -467,7 +627,10 @@ def run_eval(
 
     results = []
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {pool.submit(_run_one_shot, t, client, enable_thinking): t for t in task_list}
+        futures = {
+            pool.submit(_run_one_shot, t, client, enable_thinking, extractor): t
+            for t in task_list
+        }
         for fut in as_completed(futures):
             try:
                 record = fut.result()
@@ -491,6 +654,7 @@ def run_mixed(
     total_budget: int | None = None,
     concurrency: int = 4,
     enable_thinking: bool = False,
+    extractor: "ModelClient | None" = None,
     on_slip: Callable[[dict], None] | None = None,
     on_result: Callable[[dict], None] | None = None,
 ) -> dict:
@@ -523,6 +687,7 @@ def run_mixed(
             client=client,
             total_budget=total_budget,
             enable_thinking=enable_thinking,
+            extractor=extractor,
             on_slip=on_slip,
         )
 
@@ -540,6 +705,7 @@ def run_mixed(
             client=client,
             concurrency=concurrency,
             enable_thinking=enable_thinking,
+            extractor=extractor,
             on_result=_collect,
         )
 
