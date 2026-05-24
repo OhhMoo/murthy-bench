@@ -152,39 +152,71 @@ inference endpoint. It is the primary benchmark target for this project.
 
 ### 5a. What needs to be configured
 
-Three values, all of which can live in `~/.longevity/config.json` or
-in your shell environment:
+Reading from `longivity_hack/benchmark/config.py`:
 
-| Config key | Env var | Required? | What it's for |
-|---|---|---|---|
-| `llm.endpoint` | `L_LLM_ENDPOINT` | yes | HuggingFace inference URL for the L-LLM |
-| `hf.token` | `HF_TOKEN` | yes | Sent as the bearer token to the endpoint AND used to access the gated LongeBench dataset |
-| `llm.model` | — | optional | Display alias the CLI matches against. Defaults to `longevity-llm`; only change it if you renamed the model. |
+```python
+_DEFAULTS = {
+    "llm.endpoint":  None,             # ← you MUST set this
+    "llm.model":     "longevity-llm",  # ← already correct; only change if renamed
+    "hf.token":      None,             # ← you MUST set this
+    ...
+}
+_ENV_OVERRIDES = {
+    "llm.endpoint":  "L_LLM_ENDPOINT",
+    "hf.token":      "HF_TOKEN",
+    ...
+}
+```
 
-### 5b. Set the values — pick any one
+So for L-LLM you need exactly two values:
 
-**Option A — `.env` (recommended for repeat use):**
+| Config key | Env var | What it's for |
+|---|---|---|
+| `llm.endpoint` | `L_LLM_ENDPOINT` | The HuggingFace inference URL for the L-LLM (provided by the hackathon organisers; the working tree's `longivity_hack/.env.example` has the current default) |
+| `hf.token` | `HF_TOKEN` | Sent as the bearer token to the endpoint AND used to access the gated `insilicomedicine/longebench` dataset |
+
+Env vars shadow file values per `config.get()` precedence: env first, then
+`~/.longevity/config.json`, then the defaults above.
+
+### 5b. Set the values
+
+**Option A — `.env` (recommended; sets both at once):**
 
 ```bash
 cp longivity_hack/.env.example .env
-# edit .env, fill in L_LLM_ENDPOINT and HF_TOKEN
+# edit .env, fill in real values for HF_TOKEN and L_LLM_ENDPOINT
 set -a; source .env; set +a
 ```
 
-**Option B — CLI:**
+`set -a` makes every variable assignment in `.env` an export, so
+`HF_TOKEN` and `L_LLM_ENDPOINT` land in the environment of the shell
+you then run `murthy` from.
+
+**Option B — `murthy config set` (writes to `~/.longevity/config.json`):**
 
 ```bash
 murthy config set llm.endpoint https://<your-endpoint>.huggingface.cloud
 murthy config set hf.token     hf_xxxxxxxxxxxxx
 ```
 
-**Option C — interactive wizard:**
+Note: `set_value()` also exports the matching env var for the current
+process, so a subsequent `murthy` invocation in the same shell sees the
+new value immediately. New shells pick it up from `config.json`.
+
+**Option C — the `/setup` wizard inside chat (HF token only):**
 
 ```bash
-murthy            # then type /setup inside the chat
+murthy
+> /setup
 ```
 
-The wizard also live-checks the HF token against the LongeBench gate.
+The wizard (`_setup_wizard()` in `longivity_hack/benchmark/chat.py`)
+walks three steps: Anthropic key, HF token (with a live LongeBench access
+check via `datasets.load_dataset(..., streaming=True)`), and OpenAI key.
+
+> **The wizard does NOT prompt for `llm.endpoint`.** You still have to
+> set the endpoint via Option A or B. Use the wizard for the HF token
+> half, then add the endpoint separately.
 
 ### 5c. Verify the connection
 
@@ -203,20 +235,43 @@ the endpoint URL is wrong or the endpoint is paused.
 ### 5d. How the CLI handles L-LLM automatically
 
 Once `llm.endpoint` and `hf.token` are in config, the model name
-`longevity-llm` is special-cased throughout the CLI:
+`longevity-llm` (or whatever `llm.model` is set to) is special-cased
+throughout the CLI by two helpers in `longivity_hack/benchmark/chat.py`:
 
-- `/test longevity-llm`, `/benchmark longevity-llm`, `/status longevity-llm`
-  and any tool-use call that names this model automatically swap
-  `provider=endpoint` and inject `llm.endpoint` + `hf.token`. You do
-  not need `/provider endpoint` first.
-- Whenever the resolved provider is `endpoint`, Estimathon runs in
-  **isolated per-problem context mode** — each slip is a fresh single-turn
-  API call containing only the target problem and its prior wrong
-  intervals (~210 tokens per call, vs. ~24k for the legacy shared-budget
-  flow). Many HF-hosted models have no continuous conversation memory,
-  so this gives them the best chance to actually use the feedback.
-- The run panel shows `Mode: estimathon (isolated context)` in yellow
-  when this is active.
+- `_is_longevity_llm(model)` matches both the literal alias and the
+  configured `llm.model` value.
+- `_route_longevity_llm(model, provider, api_key, endpoint_url)`
+  rewrites the call to `provider="endpoint"` and fills `endpoint_url`
+  + `api_key` from config — unless the caller already passed them.
+
+This routing fires at the top of `_tool_run_benchmark` and inside
+`_resolve_client`, so every entry point benefits:
+
+- `/test longevity-llm` (chat.py:780)
+- `/benchmark longevity-llm` (chat.py:892)
+- `/status longevity-llm` (chat.py:898)
+- `/model longevity-llm` — pins it AND flips `state.bench_provider`
+  to `endpoint` (chat.py:866) so the panel and subsequent commands
+  stay coherent.
+- Claude tool-use calls naming this model.
+
+Once routing has produced `provider == "endpoint"` and the mode is
+`estimathon` or `mixed`, `_tool_run_benchmark` sets
+`use_isolated = True` (chat.py:472) and dispatches to
+`run_estimathon_isolated()` (`runner.py`). That runner:
+
+- Sends one fresh single-turn API call per slip (no growing conversation)
+- Includes only the target problem + the prior wrong intervals for THAT
+  problem + remaining-slip count
+- Uses a round-robin scheduler so the model never has to choose which
+  problem to attempt — it just answers the one in front of it
+- Per-call prompt drops from ~24k tokens (legacy shared-budget flow)
+  to ~210 tokens, which matters because many HF-hosted endpoint models
+  have no continuous conversation memory
+
+The run panel shows `Mode: estimathon (isolated context)` in yellow
+when this path is active. Turn on `/cheat` to see a green-background
+`Slip N/B → Pn (attempt k/3)` header before each request dump.
 
 ### 5e. Run a quick smoke test
 
