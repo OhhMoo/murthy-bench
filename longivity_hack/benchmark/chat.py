@@ -1000,12 +1000,34 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
         return True
 
     if cmd == "/config":
-        if len(args) >= 2:
-            cfg.set_value(args[0], args[1])
-            console.print(f"[green]●[/green] {args[0]} = [cyan]{args[1]!r}[/cyan]")
-        elif len(args) == 1:
-            val = cfg.get(args[0])
-            console.print(f"  {args[0]} = [cyan]{val!r}[/cyan]")
+        # Accept both grammars:
+        #   /config <key> <value>       (legacy slash form)
+        #   /config set <key> <value>   (matches `murthy config set …` CLI)
+        #   /config get <key>           (matches the CLI for symmetry)
+        sub_args = args
+        if sub_args and sub_args[0].lower() in ("set", "get", "unset"):
+            verb = sub_args[0].lower()
+            sub_args = sub_args[1:]
+            if verb == "set" and len(sub_args) < 2:
+                console.print("[yellow]Usage: /config set <key> <value>[/yellow]")
+                return True
+            if verb in ("get", "unset") and len(sub_args) < 1:
+                console.print(f"[yellow]Usage: /config {verb} <key>[/yellow]")
+                return True
+            if verb == "unset":
+                cfg.set_value(sub_args[0], None)
+                console.print(f"[green]●[/green] {sub_args[0]} = [dim]unset[/dim]")
+                return True
+
+        if len(sub_args) >= 2:
+            # Join remaining tokens so unquoted URLs still work
+            # ("/config set llm.endpoint https://… extra" would otherwise drop tokens).
+            key, value = sub_args[0], " ".join(sub_args[1:])
+            cfg.set_value(key, value)
+            console.print(f"[green]●[/green] {key} = [cyan]{value!r}[/cyan]")
+        elif len(sub_args) == 1:
+            val = cfg.get(sub_args[0])
+            console.print(f"  {sub_args[0]} = [cyan]{val!r}[/cyan]")
         else:
             for k, v in sorted(cfg.all_values().items()):
                 display = str(v) if v is not None else "[dim]not set[/dim]"
