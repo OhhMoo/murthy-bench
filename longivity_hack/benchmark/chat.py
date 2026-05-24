@@ -643,13 +643,33 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
 
     if cmd == "/test":
         model = _resolve_model(args[0]) if args else state.bench_model
+
+        # Auto-route the configured L-LLM model name to its endpoint, so
+        # `/test longevity-llm` doesn't get sent to Anthropic (→ 404).
+        provider     = state.bench_provider
+        endpoint_url = None
+        api_key      = None
+        if model == cfg.get("llm.model") or model == "longevity-llm":
+            endpoint_url = cfg.get("llm.endpoint")
+            api_key      = cfg.get("hf.token")
+            if not endpoint_url or not api_key:
+                console.print(
+                    "[red]●[/red] longevity-llm needs [cyan]llm.endpoint[/cyan] and "
+                    "[cyan]hf.token[/cyan] in config. Run [bold]/setup[/bold] or "
+                    "[bold]/config[/bold]."
+                )
+                return True
+            provider = "endpoint"
+
         console.print(
             f"[dim]Estimathon trial — 20 longebench tasks, 40-slip budget  "
-            f"·  model=[cyan]{model}[/cyan]…[/dim]"
+            f"·  model=[cyan]{model}[/cyan]  ·  provider=[cyan]{provider}[/cyan]…[/dim]"
         )
         _tool_run_benchmark(
             model=model,
-            provider=state.bench_provider,
+            provider=provider,
+            api_key=api_key,
+            endpoint_url=endpoint_url,
             tasks_source="longebench",
             mode="estimathon",
             budget=40,
