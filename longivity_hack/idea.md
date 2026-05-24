@@ -45,7 +45,9 @@ After each slip the model also sees:
 - Remaining slips in the shared budget
 - A warning if it replaced a previously GOOD interval with a BAD one
 
-**Shared budget**: One pool of slips across all N problems (default `floor(18/13 × N)`, matching the real Estimathon's 18-slip / 13-problem ratio). The model must decide how to allocate: spend more slips refining a hard problem, or lock in an answer early and move on.
+**Shared budget**: One pool of slips across all N problems (default `floor(18/13 × N)`, matching the real Estimathon's exact 18-slip / 13-problem ratio). The model must decide how to allocate: spend more slips refining a hard problem, or lock in an answer early and move on.
+
+**Per-problem cap**: Each problem can be attempted at most 3 times (`_MAX_SLIPS_PER_PROBLEM = 3`). Attempts beyond the cap are rejected without consuming a slip — the model is told to move on. This prevents the degenerate strategy of spending the entire budget on one problem.
 
 ---
 
@@ -123,8 +125,9 @@ The benchmark can run against the full InSilico LongeBench dataset (32K+ tasks) 
 
 ### Task Filtering
 LongeBench contains 6 task formats: regression, pairwise, binary, multiclass, ternary, generation.
-Only **regression** and **pairwise** tasks are compatible with interval-based estimathon scoring
-(they have numeric gold values). Non-numeric tasks are filtered out automatically.
+Only **regression** tasks are compatible with interval-based estimathon scoring (numeric gold values).
+`pairwise` tasks ask "which individual is older? A or B" — gold is a letter, not a number, so they
+are routed to the one-shot track instead. Non-numeric tasks are filtered out of Estimathon automatically.
 
 ### Prompt Transformation
 Raw LongeBench tasks ask for a single point answer. The adapter rewrites them to ask for intervals:
@@ -192,5 +195,6 @@ Minimum 50 instances per task. Budget fixed at 5 rounds per task (or shared pool
 | Refinement accuracy | Fraction of voluntary bets on GOOD intervals that succeeded | Higher better |
 | Budget used | `slips_used / total_budget` | Lower better |
 
-**Default budget**: `floor(18/13 × N)` slips for N problems (e.g. 10 slips for 7 problems).  
-**Baseline**: a random-interval agent achieves ~50% refinement accuracy and high width factors — any well-calibrated model should beat both.
+**Default budget**: `floor(18/13 × N)` slips for N problems (e.g. 18 slips for 13 problems — exact Estimathon ratio).  
+**Trivial baseline**: submitting `[1, 100]` for all age-estimation tasks scores ~10,010 (w=100, all GOOD). A biologically-informed model must beat this by narrowing intervals using domain knowledge.  
+**Random baseline**: a random-interval agent achieves ~50% refinement accuracy — any well-calibrated model should beat both.

@@ -577,3 +577,118 @@ The model manager works seamlessly with the existing transformation layer:
 ✅ `/model list` displays formatted table
 ✅ `/model search` works with multi-word queries
 ✅ `/batch` resolves indices to model IDs and runs sequentially
+
+---
+
+## 2026-05-23 — Diverse sampling, model shorthands, progress bar, /explore
+
+### Problem: all /test tasks were the same question type
+
+LongeBench is ordered by lb_id. The first 6,095 regression rows are all `LB-0010`
+(DNA methylation age estimation). Running `/test` with limit=20 produced 20 identical
+question types — not a useful cross-domain evaluation.
+
+### Fix: diverse sampling in loader
+
+Added `_load_longebench_diverse()` to `loader.py`. Strategy:
+
+1. Scan the first `_DIVERSE_SCAN_CAP = 3000` rows of LongeBench
+2. Group eligible (estimathon-compatible) tasks by `lb_id` into a pool
+3. Compute `per_type = max(1, limit // n_types)` slots per type
+4. Distribute remainder slots to the first N types
+5. Fill shortfalls from leftovers, shuffle the final list
+
+`load_tasks()` now accepts `diverse=True`. `/test` passes `diverse=True` so its
+20-task trial samples evenly across all regression task types found in the first 3000 rows.
+
+**Added /explore command** to show what's in that pool: scans 3000 rows, groups by lb_id,
+prints a Rich table of all unique task types with their format, domain, example gold value,
+Estimathon-compatibility flag (✓/✗), and row count. Useful for understanding what the
+benchmark is actually testing before running it.
+
+### Model shorthands
+
+`_resolve_model()` maps short names to full Claude model IDs:
+- `sonnet` → `claude-sonnet-4-6`
+- `haiku` → `claude-haiku-4-5-20251001`
+- `opus` → `claude-opus-4-7`
+
+`/test` now accepts an optional model argument: `/test sonnet`, `/test haiku`, `/test opus`,
+or any full model ID. `/model <shorthand>` also resolves through the same map.
+
+### Progress bar
+
+Replaced ad-hoc slip printing with a Rich `Progress` bar showing two tracks:
+- **slips**: slip number out of total budget
+- **solved**: number of currently-GOOD problems out of total
+
+Uses bamboo green palette (`rgb(45,80,25)` → `rgb(195,225,100)`). Slip details (Q preview,
+model response, GOOD/BAD, width, score delta) are printed above the bar using
+`_progress.console.print()` so the bar stays pinned at the bottom.
+
+### Budget ratio corrected
+
+Changed from the approximate `floor(1.38 × N)` to the exact `floor(18/13 × N)`.
+At N=13 the old formula gave 17 slips instead of the correct 18.
+Updated everywhere: `runner.py`, `cli.py`, `CLAUDE.md`, `idea.md`.
+
+### Files modified
+- `benchmark/loader.py`: `_DIVERSE_SCAN_CAP`, `diverse` param, `_load_longebench_diverse()`
+- `benchmark/chat.py`: `_resolve_model()`, `_MODEL_SHORTHANDS`, `/test` diverse+model arg,
+  `/explore` command, Rich Progress bar with two tracks
+
+---
+
+## 2026-05-23 — pip packaging, first-run setup wizard, GitHub Actions CI
+
+### pip package: murthy-bench
+
+Added `pyproject.toml` at the repo root. Package name: `murthy-bench`.
+Entry points: `murthy` and `murthy-bench` both launch `longivity_hack.cli:entry`.
+
+Dependencies moved from `requirements.txt` to `pyproject.toml` as required deps —
+including `datasets>=2.0.0` (previously optional) since LongeBench is the main task source.
+Requires Python ≥ 3.11 (needed for `sys.set_int_max_str_digits`).
+
+### First-run setup wizard
+
+`run_chat()` previously exited with an error if no Anthropic key was set.
+Changed: if no key is found on startup, show a "First Run Setup" welcome panel and call
+`_setup_wizard()` automatically before opening the chat loop.
+
+After the wizard, the key is re-read from config. If still not set (user skipped all steps),
+show the manual config command and exit cleanly.
+
+**User flow on a fresh machine:**
+```
+pip install murthy-bench
+murthy
+→  First Run Setup wizard
+→  [1/3] Anthropic key
+→  [2/3] HuggingFace token + live LongeBench access check
+→  [3/3] OpenAI key (optional)
+→  Chat opens
+```
+
+### GitHub Actions: auto-publish on version tag
+
+Added `.github/workflows/publish.yml`. Triggers on `v*` tags pushed to main.
+Uses `pypa/gh-action-pypi-publish` with OIDC trusted publishing — no API tokens stored
+in GitHub Secrets. One-time setup: add a trusted publisher on pypi.org pointing to this
+repo and workflow file.
+
+**Release flow:**
+```
+git add . && git commit -m "release v0.x.x"
+git tag v0.x.x
+git push origin main --tags
+```
+
+GitHub Actions builds the wheel and sdist, runs `twine check`, and uploads to PyPI.
+
+### Files created/modified
+- **New:** `pyproject.toml` — package metadata, deps, entry points
+- **New:** `.github/workflows/publish.yml` — CI publish workflow
+- **Modified:** `benchmark/chat.py` — first-run setup wizard in `run_chat()`; version bump to v0.2.1
+- **Modified:** `.gitignore` — added `dist/`, `build/`, `*.egg-info/`, `*.jsonl`
+- **Modified:** `README.md` — rewritten for `pip install murthy-bench` workflow
