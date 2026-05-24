@@ -175,50 +175,50 @@ def _problem_content(task: dict) -> str:
 
 
 def _build_system_prompt(n_problems: int, total_budget: int) -> str:
-    return f"""You are playing Estimathon — a scientific estimation game.
+    return f"""You are playing Estimathon over {n_problems} problems with {total_budget} total slips.
 
-Rules:
-- You have {total_budget} slips total across {n_problems} problems.
-- Each slip: submit ONE interval for ONE problem only. Do not submit multiple problems in a single message.
-- Intervals must have positive values (min > 0, max > min).
-- An interval is GOOD if it contains the correct numeric answer.
-- ONLY your LAST submission for each problem counts toward your final score.
-- If you refine a GOOD interval and your new interval is BAD, you lose that problem.
-- You may attempt each problem AT MOST {_MAX_SLIPS_PER_PROBLEM} times. After that it is locked — choose a different problem.
+OUTPUT FORMAT (mandatory) — every reply must be EXACTLY two lines, nothing else:
 
-Scoring formula (lower is better):
-  (10 + sum of floor(max/min) for all GOOD final intervals) × 2^({n_problems} − number of GOOD final answers)
-
-CRITICAL STRATEGY — read this carefully:
-
-Outcome priority (best → worst):
-  1. GOOD & narrow  → ideal: correct answer, small max/min ratio
-  2. GOOD & wide    → safe:  correct answer, large ratio — still FAR better than any BAD
-  3. BAD  & wide    → bad:   wrong — your ENTIRE score doubles
-  4. BAD  & narrow  → worst: wrong AND you wasted precision — score still doubles
-
-Every unsolved problem doubles your entire score.
-A correct wide interval is ALWAYS better than a wrong narrow one.
-
-Optimal play:
-  Step 1 — Secure GOOD first: submit a WIDE interval to guarantee correctness.
-           When uncertain, start very wide: e.g. [1, 1000] or [10, 100000].
-  Step 2 — Narrow only when confident: use remaining slips to tighten the interval.
-           Only submit a narrow interval if you are sure it contains the answer.
-  Step 3 — Cover all problems: spread slips across problems before refining any one.
-
-You receive ONLY binary feedback: GOOD or BAD. No directional hints.
-Never start narrow — a missed narrow guess costs a doubled score AND burns a slip.
-
-OUTPUT FORMAT — THIS IS MANDATORY:
-Your entire response must be ONLY these two lines. No explanation. No reasoning. No other text.
-
-PROBLEM <number>
+PROBLEM <n>
 INTERVAL [min, max]
 
-Example:
-PROBLEM 3
-INTERVAL [45, 78]"""
+Where <n> is 1..{n_problems} and min < max, both positive numbers.
+
+Examples that are CORRECT:
+  PROBLEM 3
+  INTERVAL [30, 90]
+
+  PROBLEM 12
+  INTERVAL [12.5, 18.0]
+
+Examples that are WRONG (never output these shapes):
+  PROBLEM 3                   ← missing the INTERVAL line
+  42.0                        ← single number, missing the range
+  The answer is 42.           ← prose / explanation
+  INTERVAL [50, 50]           ← min must be strictly less than max
+  INTERVAL [-3, 10]           ← min must be positive
+  PROBLEM 3 INTERVAL [1,2]    ← must be two separate lines
+  ```\nPROBLEM 3\n```         ← no markdown, no code fences
+
+Hard rules — these matter MORE than scoring:
+- NEVER repeat an interval that was already marked BAD for the same problem. Repetition is the WORST failure mode and the runner will lock the problem after 2 repeats.
+- If a previous attempt was BAD, the correct answer is OUTSIDE that range. Shift the center OR widen the range — do NOT keep the same numbers.
+- A wide CORRECT interval (e.g. INTERVAL [1, 100]) is FAR better than a wrong narrow one.
+- Output nothing other than the PROBLEM + INTERVAL lines. No reasoning, no caveats, no markdown.
+
+Game rules:
+- {n_problems} problems, {total_budget} total slips, max {_MAX_SLIPS_PER_PROBLEM} attempts per problem.
+- ONLY your LAST submission for each problem counts.
+- If you refine a GOOD interval and your new one is BAD, you LOSE that problem.
+- Binary feedback only: GOOD or BAD. No directional hints.
+
+Scoring (lower is better):
+  (10 + sum of floor(max/min) for GOOD finals) × 2^({n_problems} − number of GOOD finals)
+
+Strategy:
+  1. Secure GOOD first with a WIDE interval (e.g. INTERVAL [1, 1000]).
+  2. Only narrow when you are confident.
+  3. Spread slips across problems before refining any one."""
 
 
 def _build_standings(session: EstimathonSession) -> str:
@@ -303,19 +303,55 @@ def _build_feedback(result: dict, session: EstimathonSession) -> str:
 
     pid = result["pid"]
     wrong_history = session.tried_intervals.get(pid, [])
-    wrong_note = ""
+
+    # Same FORBIDDEN block format as the isolated runner — REPEAT markers,
+    # concrete numeric alternatives, and an extra ⚠ when the model has
+    # already re-submitted the same interval for this problem.
+    forbidden_note = ""
     if wrong_history and not result["good"]:
-        wrong_note = (
-            f"Wrong intervals tried so far for Problem {pid}: "
-            + ", ".join(f"[{a}, {b}]" for a, b in wrong_history)
-            + " — none of these contained the answer.\n"
+        seen: set = set()
+        lines = []
+        has_repeat = False
+        for a, b in wrong_history:
+            if (a, b) in seen:
+                lines.append(f"  ✗ [{a}, {b}]   ← REPEAT — never submit this again")
+                has_repeat = True
+            else:
+                lines.append(f"  ✗ [{a}, {b}]")
+                seen.add((a, b))
+
+        lo_all = min(a for a, _ in wrong_history)
+        hi_all = max(b for _, b in wrong_history)
+        span = max((hi_all - lo_all) * 5, 30.0)
+        suggest_wider = f"INTERVAL [{max(1, lo_all - span):g}, {hi_all + span:g}]"
+        suggest_below = f"INTERVAL [{max(1, lo_all * 0.2):g}, {max(1.5, lo_all * 0.7):g}]"
+        suggest_above = f"INTERVAL [{hi_all * 1.3:g}, {hi_all * 3:g}]"
+
+        repeat_warning = ""
+        if has_repeat:
+            repeat_warning = (
+                "\n⚠  You have ALREADY submitted the same interval more than once "
+                "for this problem. Repeating it AGAIN is forbidden — change the numbers."
+            )
+
+        forbidden_note = (
+            f"\n━━━ FORBIDDEN INTERVALS for Problem {pid} ━━━\n"
+            + "\n".join(lines)
+            + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + "Correct answer is OUTSIDE every range above. Your new INTERVAL for "
+            + f"Problem {pid} MUST differ from every line above."
+            + repeat_warning
+            + "\nConcrete options for this problem (any DIFFERENT range works):\n"
+            + f"  • {suggest_wider}   ← much wider\n"
+            + f"  • {suggest_below}   ← shifted lower\n"
+            + f"  • {suggest_above}   ← shifted higher\n"
         )
 
     return (
         f"Problem [{pid}]: {good_str}.{width_note}{warning}\n"
-        f"{wrong_note}"
         f"{attempt_note}\n"
-        f"{score_line}\n\n"
+        f"{score_line}"
+        f"{forbidden_note}\n\n"
         f"Standings:\n{standings}\n\n"
         f"{next_prompt}"
     )
@@ -555,6 +591,18 @@ def run_estimathon_isolated(
                 break
             cursor = (cursor + 1) % n  # skip this problem this round
             continue
+
+        # Hard server-side exact-repeat rejection. Burns a per-problem
+        # attempt slot so the problem locks faster, but does NOT burn
+        # a slip — the model gets a chance to actually change its answer.
+        if session.last_submissions.get(pid) == (pmin, pmax):
+            session.per_problem_slips[pid] = session.per_problem_slips.get(pid, 0) + 1
+            parse_failures += 1
+            if parse_failures >= 3:
+                print(f"\n[Estimathon-iso] 3 consecutive exact-repeat submissions. Returning partial results.")
+                break
+            cursor = (cursor + 1) % n  # advance to a different problem
+            continue
         parse_failures = 0
 
         session.per_problem_slips[pid] = session.per_problem_slips.get(pid, 0) + 1
@@ -700,10 +748,43 @@ def run_estimathon(
 
         pid = f"P{problem_num}"
 
-        # Warn on identical repeat submissions but still process (burn the slip).
-        repeat_note = ""
-        if pid in session.last_submissions and session.last_submissions[pid] == (pmin, pmax):
-            repeat_note = f"NOTE: [{pmin}, {pmax}] for Problem {problem_num} was already submitted and scored BAD.\n"
+        # Hard server-side rejection of exact-repeat submissions: a stateless
+        # model that doesn't read the FORBIDDEN block can no longer waste
+        # slips by re-emitting the same numbers. First repeat = free retry
+        # with a stronger nudge. Second repeat = lock the problem so the
+        # model is forced to move on.
+        already_tried = pid in session.last_submissions and session.last_submissions[pid] == (pmin, pmax)
+        if already_tried:
+            session.per_problem_slips[pid] = session.per_problem_slips.get(pid, 0) + 1
+            attempts_after = session.per_problem_slips[pid]
+            parse_failures += 1
+            if parse_failures >= 3:
+                print(
+                    f"\n[Estimathon] 3 consecutive exact-repeat submissions. "
+                    f"Returning partial results."
+                )
+                break
+            if attempts_after >= _MAX_SLIPS_PER_PROBLEM:
+                conversation.append({"role": "assistant", "content": resp.answer})
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        f"REJECTED: [{pmin}, {pmax}] for Problem {problem_num} is an EXACT REPEAT — "
+                        f"Problem {problem_num} is now LOCKED. Choose a different problem.\n\n"
+                        f"Slips remaining: {session.slips_remaining}"
+                    ),
+                })
+            else:
+                conversation.append({"role": "assistant", "content": resp.answer})
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        f"REJECTED: [{pmin}, {pmax}] for Problem {problem_num} is an EXACT REPEAT of a prior wrong submission. "
+                        f"No slip burned. You MUST submit a DIFFERENT interval — shift the center or widen the range.\n\n"
+                        f"Slips remaining: {session.slips_remaining}"
+                    ),
+                })
+            continue
 
         # Enforce per-problem attempt cap — reject without burning a slip.
         # Bail if the model keeps picking the same locked problem (stateless
@@ -742,12 +823,15 @@ def run_estimathon(
         result["lb_id"] = tasks[task_idx].get("lb_id", pid)
         result["attempts_used"] = attempts_used
         result["attempts_left"] = attempts_left
-        result["parse_source"] = parse_src  # 'interval' or 'point' (fallback)
+        # Legacy runner uses the strict parser only — no point-estimate
+        # fallback. Tag every slip as "interval" for downstream consumers
+        # that key off parse_source.
+        result["parse_source"] = "interval"
 
         if on_slip:
             on_slip(result)
 
-        feedback = repeat_note + _build_feedback(result, session)
+        feedback = _build_feedback(result, session)
         conversation.append({"role": "assistant", "content": resp.answer})
         conversation.append({"role": "user", "content": feedback})
 
