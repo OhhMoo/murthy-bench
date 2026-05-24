@@ -530,6 +530,9 @@ def _tool_run_benchmark(
             _solved_pids.discard(pid)
         _progress.update(_prob_bar, completed=len(_solved_pids))
 
+        point_tag = ""
+        if r.get("parse_source") == "point":
+            point_tag = "  [yellow](point→interval)[/yellow]"
         _progress.console.print(
             f"  [dim]#{r['slip']:02d}[/dim]  "
             f"[cyan]{r['pid']:<5}[/cyan] [dim]{display_id:<14}[/dim]  "
@@ -538,6 +541,7 @@ def _tool_run_benchmark(
             + f"  [dim]{_fmt_score(r['score_before'])} → {_fmt_score(r['score_after'])}[/dim]"
             + (" [yellow]⚠ lost good[/yellow]" if r.get("prev_was_good") and not good else "")
             + attempt_tag
+            + point_tag
         )
         # Debug: show the question text and raw model response
         question = r.get("task_content", "")

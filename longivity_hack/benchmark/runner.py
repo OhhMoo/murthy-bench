@@ -52,6 +52,42 @@ def parse_interval(text: str) -> tuple[float | None, float | None]:
     return None, None
 
 
+# Point-estimate fallback for the isolated runner only. Smaller endpoint
+# models (e.g. L-LLM) sometimes return a bare number like "42.0" when they
+# have high confidence — meaningful behaviour we shouldn't throw away.
+# We treat it as the centre of an interval with ±30% margin: max/min stays
+# below 2 so the width-factor in the scoring formula remains 1 (tight GOOD
+# is the best possible outcome), but the band is wide enough to catch
+# estimates that are off by up to ~30%.
+_BARE_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
+
+
+def parse_interval_with_point_fallback(
+    text: str,
+) -> tuple[float | None, float | None, str]:
+    """Return (pmin, pmax, source).
+
+    source ∈ {'interval', 'point', 'none'}:
+      interval — parsed a real [min, max] pair
+      point    — parsed a single number, expanded to ±30% margin
+      none     — couldn't find any usable numbers
+    """
+    pmin, pmax = parse_interval(text)
+    if pmin is not None and pmax is not None and pmin > 0 and pmax > pmin:
+        return pmin, pmax, "interval"
+
+    m = _BARE_NUMBER_RE.search(text)
+    if m:
+        try:
+            n = float(m.group())
+        except ValueError:
+            return None, None, "none"
+        if n > 0:
+            margin = max(n * 0.30, 1.0)
+            return n - margin, n + margin, "point"
+    return None, None, "none"
+
+
 # ---------------------------------------------------------------------------
 # Estimathon session (shared budget, last-submission-counts, binary feedback)
 # ---------------------------------------------------------------------------
@@ -460,8 +496,8 @@ def run_estimathon_isolated(
             print(f"\n[Estimathon-iso] API error: {exc}. Returning partial results.")
             break
 
-        pmin, pmax = parse_interval(resp.answer)
-        if pmin is None or pmax is None or pmin <= 0 or pmax <= pmin:
+        pmin, pmax, parse_src = parse_interval_with_point_fallback(resp.answer)
+        if parse_src == "none":
             parse_failures += 1
             if parse_failures >= 3:
                 print(f"\n[Estimathon-iso] 3 consecutive parse failures. Returning partial results.")
@@ -655,6 +691,7 @@ def run_estimathon(
         result["lb_id"] = tasks[task_idx].get("lb_id", pid)
         result["attempts_used"] = attempts_used
         result["attempts_left"] = attempts_left
+        result["parse_source"] = parse_src  # 'interval' or 'point' (fallback)
 
         if on_slip:
             on_slip(result)
