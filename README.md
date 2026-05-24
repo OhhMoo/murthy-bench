@@ -56,7 +56,10 @@ murthy config list
 ```
 
 ---
+## Data
+All training and testing set are transfered to Huggingface with: https://huggingface.co/datasets/sarahliu/updatedRNABench.
 
+---
 ## Interactive chat
 
 ```bash
