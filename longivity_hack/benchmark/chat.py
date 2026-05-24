@@ -441,6 +441,17 @@ def _tool_run_benchmark(
     limit: int | None = None, think: bool = False, output: str = "results.jsonl",
     diverse: bool = False,
 ) -> str:
+    # Apply L-LLM auto-routing UP FRONT so every downstream decision
+    # (isolated-mode dispatch, panel display, client construction) sees the
+    # effective provider. Without this, `/test longevity-llm` keeps
+    # provider="anthropic" through the isolated-mode check, falls through
+    # to the legacy multi-turn runner, and blasts ~12k tokens at the
+    # endpoint per slip.
+    routed = _route_longevity_llm(model, provider, api_key, endpoint_url)
+    if isinstance(routed, str):
+        return f"Credential error: {routed}"
+    provider, api_key, endpoint_url = routed
+
     client = _resolve_client(model, provider, api_key, endpoint_url)
     if isinstance(client, str):
         return client

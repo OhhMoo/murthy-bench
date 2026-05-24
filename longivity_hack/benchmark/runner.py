@@ -576,27 +576,42 @@ def run_estimathon(
             conversation.append({"role": "user", "content": nudge})
             continue
 
-        parse_failures = 0
+        # Reject degenerate intervals (min == max can never contain a value).
+        # Count as a parse failure BEFORE the reset below — otherwise a
+        # stateless model that keeps returning the same degenerate response
+        # would have its counter zeroed every turn and loop forever.
+        if pmin == pmax or pmin <= 0 or pmax < pmin:
+            parse_failures += 1
+            if parse_failures >= 3:
+                print(
+                    f"\n[Estimathon] 3 consecutive invalid intervals "
+                    f"(last: [{pmin}, {pmax}]). Returning partial results."
+                )
+                break
+            conversation.append({"role": "assistant", "content": resp.answer})
+            conversation.append({
+                "role": "user",
+                "content": (
+                    f"INVALID: [{pmin}, {pmax}] — need positive min < max.\n\n"
+                    f"Slips remaining: {session.slips_remaining}"
+                ),
+            })
+            continue
 
         task_idx = problem_num - 1
         if task_idx < 0 or task_idx >= n:
+            parse_failures += 1
+            if parse_failures >= 3:
+                print(
+                    f"\n[Estimathon] 3 consecutive references to nonexistent problem "
+                    f"(last: {problem_num}, valid: 1–{n}). Returning partial results."
+                )
+                break
             conversation.append({"role": "assistant", "content": resp.answer})
             conversation.append({"role": "user", "content": f"Problem {problem_num} does not exist. Choose 1–{n}."})
             continue
 
         pid = f"P{problem_num}"
-
-        # Reject degenerate intervals (min == max can never contain a value).
-        if pmin == pmax:
-            conversation.append({"role": "assistant", "content": resp.answer})
-            conversation.append({
-                "role": "user",
-                "content": (
-                    f"INVALID: [{pmin}, {pmax}] — min and max cannot be equal.\n\n"
-                    f"Slips remaining: {session.slips_remaining}"
-                ),
-            })
-            continue
 
         # Warn on identical repeat submissions but still process (burn the slip).
         repeat_note = ""
@@ -604,8 +619,17 @@ def run_estimathon(
             repeat_note = f"NOTE: [{pmin}, {pmax}] for Problem {problem_num} was already submitted and scored BAD.\n"
 
         # Enforce per-problem attempt cap — reject without burning a slip.
+        # Bail if the model keeps picking the same locked problem (stateless
+        # models that don't read the rejection message would loop forever).
         attempts_so_far = session.per_problem_slips.get(pid, 0)
         if attempts_so_far >= _MAX_SLIPS_PER_PROBLEM:
+            parse_failures += 1
+            if parse_failures >= 3:
+                print(
+                    f"\n[Estimathon] 3 consecutive picks of LOCKED problem {problem_num}. "
+                    f"Returning partial results."
+                )
+                break
             conversation.append({"role": "assistant", "content": resp.answer})
             conversation.append({
                 "role": "user",
@@ -618,6 +642,8 @@ def run_estimathon(
             })
             continue
 
+        # Reset the no-progress counter — we're about to make a real submission.
+        parse_failures = 0
         session.per_problem_slips[pid] = attempts_so_far + 1
         attempts_used = attempts_so_far + 1
         attempts_left = _MAX_SLIPS_PER_PROBLEM - attempts_used
