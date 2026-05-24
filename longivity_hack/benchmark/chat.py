@@ -216,6 +216,78 @@ _TOOLS = [
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+def _print_multi_attempt_table(slip_records: list[dict]) -> None:
+    """Show per-problem revision history for problems answered more than once.
+
+    Highlights how the model evolved (or didn't) across attempts — useful for
+    spotting models that just resubmit the same interval vs ones that adapt.
+    """
+    by_pid: dict[str, list[dict]] = {}
+    for r in slip_records:
+        by_pid.setdefault(r["pid"], []).append(r)
+
+    repeats = {pid: rs for pid, rs in by_pid.items() if len(rs) > 1}
+    if not repeats:
+        return
+
+    table = Table(
+        title="[bold rgb(195,225,100)]Multi-attempt summary[/bold rgb(195,225,100)]  "
+              "[dim](only problems answered more than once)[/dim]",
+        border_style="rgb(100,145,55)",
+        show_lines=False,
+        padding=(0, 1),
+    )
+    table.add_column("Problem",     style="cyan",   no_wrap=True)
+    table.add_column("Gold",        style="dim",    justify="right", no_wrap=True)
+    table.add_column("#",           style="dim",    justify="right", no_wrap=True)
+    table.add_column("Attempts  [dim](=  same as prev,  ≠  changed)[/dim]")
+    table.add_column("Final",       no_wrap=True)
+
+    for pid in sorted(repeats.keys(), key=lambda p: (-len(repeats[p]), p)):
+        records = repeats[pid]
+        gold = records[0].get("gold")
+        gold_str = f"{gold:g}" if isinstance(gold, (int, float)) else "—"
+
+        # Build the attempt sequence with change markers
+        parts = []
+        prev = None
+        for r in records:
+            pmin, pmax = r.get("pred_min"), r.get("pred_max")
+            good = r.get("good", False)
+            colour = "green" if good else "red"
+            tag    = "GOOD" if good else "BAD "
+            interval = f"[{pmin:g}, {pmax:g}]" if pmin is not None and pmax is not None else "—"
+
+            if prev is None:
+                marker = " "
+            elif prev == (pmin, pmax):
+                marker = "[yellow]=[/yellow]"   # same interval as previous attempt
+            else:
+                marker = "[dim]≠[/dim]"
+            parts.append(f"{marker} [{colour}]{tag}[/{colour}] {interval}")
+            prev = (pmin, pmax)
+
+        # Count how many times the model resubmitted the exact same interval
+        same_count = sum(
+            1 for i in range(1, len(records))
+            if (records[i-1].get("pred_min"), records[i-1].get("pred_max"))
+            == (records[i].get("pred_min"),   records[i].get("pred_max"))
+        )
+        last = records[-1]
+        final_good = last.get("good", False)
+        final_str = (
+            f"[green]GOOD[/green] w={last.get('width_factor')}"
+            if final_good else "[red]BAD[/red]"
+        )
+        if same_count:
+            final_str += f"  [yellow]({same_count}× repeat)[/yellow]"
+
+        table.add_row(pid, gold_str, str(len(records)), "  ".join(parts), final_str)
+
+    console.print()
+    console.print(table)
+
+
 def _is_longevity_llm(model: str) -> bool:
     """The Insilico L-LLM lives on a HF endpoint — its bare name is never a valid
     provider-side model id, so we recognise it by config or the literal alias."""
@@ -416,8 +488,10 @@ def _tool_run_benchmark(
     _slip_bar = _progress.add_task("slips  ", total=_eff_budget)
     _prob_bar = _progress.add_task("solved ", total=_n_est)
     _solved_pids: set = set()
+    _slip_records: list[dict] = []
 
     def _slip_line(r: dict) -> None:
+        _slip_records.append(r)
         good = r.get("good", False)
         wf   = r.get("width_factor")
         bar  = "█" * min(wf or 0, 20) if good else "░" * 10
@@ -511,6 +585,8 @@ def _tool_run_benchmark(
 
     console.print(Rule(style="rgb(100,145,55)"))
     console.print(f"  [bold rgb(160,200,80)]Done.[/bold rgb(160,200,80)]  {summary}  [dim]→ {output}[/dim]")
+
+    _print_multi_attempt_table(_slip_records)
     return summary
 
 
