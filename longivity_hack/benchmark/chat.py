@@ -27,6 +27,7 @@ from rich.text import Text
 from . import config as cfg
 from .client import ModelClient
 from .loader import load_tasks
+from .model_manager import ModelManager
 from .results import ResultWriter
 from .runner import (
     run_estimathon, run_eval, run_mixed,
@@ -86,7 +87,9 @@ _SLASH_META = [
     ("/test",         "Estimathon trial: 20 longebench tasks, 40-slip budget  [model]"),
     ("/exit",         "Exit the chat"),
     ("/clear",        "Clear conversation history"),
-    ("/model",        "Show or set benchmark model"),
+    ("/model",        "List/search models or set benchmark model  list|search|#|<id>"),
+    ("/batch",        "Batch benchmark multiple models  <model_ids|indices>  [provider]"),
+    ("/add",          "Add model to CSV or refresh from HuggingFace  <model_id>|refresh"),
     ("/provider",     "Show or set provider  (anthropic|openai|hf|endpoint)"),
     ("/tasks",        "Show or set default task source"),
     ("/think",        "Toggle chain-of-thought traces"),
@@ -595,15 +598,41 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
         return True
 
     if cmd == "/model":
-        if args:
-            state.bench_model = args[0]
-            console.print(f"[green]●[/green] Benchmark model → [cyan]{state.bench_model}[/cyan]")
-        else:
+        mgr = ModelManager()
+
+        if not args:
+            # Show current models
             console.print(
                 f"  chat model:      [cyan]{state.chat_model}[/cyan]\n"
                 f"  bench model:     [cyan]{state.bench_model}[/cyan]\n"
                 f"  bench provider:  [cyan]{state.bench_provider}[/cyan]"
             )
+            console.print("\n  [dim]Usage: /model <id|#> | /model list [limit] | /model search <query>[/dim]")
+            return True
+
+        subcmd = args[0].lower()
+
+        if subcmd == "list":
+            limit = int(args[1]) if len(args) > 1 else 20
+            mgr.list_models(limit=limit)
+            return True
+
+        if subcmd == "search":
+            query = " ".join(args[1:]) if len(args) > 1 else ""
+            mgr.list_models(search=query)
+            return True
+
+        # Set model by index or ID
+        if subcmd.isdigit():
+            model = mgr.get_by_index(int(subcmd))
+            if model:
+                state.bench_model = model["model_id"]
+                console.print(f"[green]●[/green] Model → [cyan]{model['model_id']}[/cyan]  ({model['author']})")
+            else:
+                console.print(f"[red]Model #{subcmd} not found[/red]")
+        else:
+            state.bench_model = _resolve_model(subcmd)
+            console.print(f"[green]●[/green] Model → [cyan]{state.bench_model}[/cyan]")
         return True
 
     if cmd == "/provider":
@@ -639,6 +668,96 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
         model    = args[0] if len(args) > 0 else state.bench_model
         provider = args[1] if len(args) > 1 else state.bench_provider
         _tool_check_model(model=model, provider=provider)
+        return True
+
+    if cmd == "/batch":
+        """Batch benchmark multiple models."""
+        mgr = ModelManager()
+
+        if not args:
+            console.print("[yellow]Usage: /batch <model_ids|indices>  [provider]  [tasks]  [limit][/yellow]")
+            console.print("  Examples:")
+            console.print("    /batch 1 2 3")
+            console.print("    /batch llama qwen")
+            console.print("    /batch 1 2 3 hf sample 7")
+            return True
+
+        # Parse arguments
+        provider = state.bench_provider
+        tasks = state.default_tasks
+        limit = 7
+
+        # Find where model IDs end
+        model_specs = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            # Check if it's a provider
+            if arg.lower() in ("hf", "openai", "anthropic", "endpoint"):
+                provider = arg.lower()
+                break
+            model_specs.append(arg)
+            i += 1
+
+        # Parse remaining args
+        if i + 1 < len(args):
+            tasks = args[i + 1]
+        if i + 2 < len(args):
+            limit = int(args[i + 2])
+
+        # Resolve models
+        models_to_run = []
+        for spec in model_specs:
+            if spec.isdigit():
+                model = mgr.get_by_index(int(spec))
+                if model:
+                    models_to_run.append(model["model_id"])
+            else:
+                # Search for matching models
+                results = mgr.search(spec, top_n=1)
+                if results:
+                    models_to_run.append(results[0]["model_id"])
+
+        if not models_to_run:
+            console.print("[red]No models found[/red]")
+            return True
+
+        console.print(
+            f"[blue]Batch benchmark: {len(models_to_run)} models  ·  "
+            f"provider=[cyan]{provider}[/cyan]  ·  tasks=[cyan]{tasks}[/cyan]  ·  limit=[cyan]{limit}[/cyan][/blue]"
+        )
+
+        for i, model in enumerate(models_to_run, 1):
+            console.print(f"\n[bold][{i}/{len(models_to_run)}] {model}[/bold]")
+            _tool_run_benchmark(
+                model=model,
+                provider=provider,
+                tasks_source=tasks,
+                limit=limit,
+                think=state.think_mode,
+            )
+        return True
+
+    if cmd == "/add":
+        """Add or update model in the CSV list."""
+        mgr = ModelManager()
+
+        if not args:
+            console.print("[yellow]Usage: /add <model_id>  [author][/yellow]")
+            console.print("  Examples:")
+            console.print("    /add meta-llama/Llama-3.2-8B")
+            console.print("    /add my-org/my-model myorg")
+            console.print("  To refresh from HuggingFace: /add refresh [num_models]")
+            return True
+
+        if args[0].lower() == "refresh":
+            num = int(args[1]) if len(args) > 1 else 300
+            mgr.refresh_from_hf(num_models=num)
+            return True
+
+        model_id = args[0]
+        author = args[1] if len(args) > 1 else "custom"
+        mgr.add_model(model_id, author=author)
         return True
 
     if cmd == "/config":
