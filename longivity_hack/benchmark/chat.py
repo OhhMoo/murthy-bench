@@ -5,6 +5,7 @@ Green-themed UI with ASCII banner, slash commands, and live thinking indicators.
 from __future__ import annotations
 
 import json
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -17,6 +18,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.rule import Rule
 from rich.spinner import Spinner
 from rich.table import Table
@@ -26,7 +28,10 @@ from . import config as cfg
 from .client import ModelClient
 from .loader import load_tasks
 from .results import ResultWriter
-from .runner import run_estimathon, run_eval, run_mixed, _fmt_score
+from .runner import (
+    run_estimathon, run_eval, run_mixed,
+    _fmt_score, _MAX_ESTIMATHON_PROBLEMS, _ESTIMATHON_FORMATS,
+)
 
 console = Console()
 
@@ -56,6 +61,21 @@ _GRADIENT = [
 _VERSION = "v0.2.0"
 _TAGLINE = "Longevity LLM Benchmark  ·  Estimathon-style evaluation"
 
+# Model shorthands for /test and /model commands
+_MODEL_SHORTHANDS: dict[str, str] = {
+    "sonnet":     "claude-sonnet-4-6",
+    "sonnet-4-6": "claude-sonnet-4-6",
+    "sonnet-4-5": "claude-sonnet-4-5",
+    "haiku":      "claude-haiku-4-5-20251001",
+    "haiku-4-5":  "claude-haiku-4-5-20251001",
+    "opus":       "claude-opus-4-7",
+    "opus-4-7":   "claude-opus-4-7",
+}
+
+def _resolve_model(arg: str) -> str:
+    """Resolve a model shorthand to its full ID, or return arg unchanged."""
+    return _MODEL_SHORTHANDS.get(arg.lower(), arg)
+
 # ---------------------------------------------------------------------------
 # Slash-command autocomplete (prompt_toolkit)
 # ---------------------------------------------------------------------------
@@ -63,7 +83,7 @@ _TAGLINE = "Longevity LLM Benchmark  ·  Estimathon-style evaluation"
 _SLASH_META = [
     ("/help",         "Show all commands"),
     ("/setup",        "Configure API keys and HuggingFace dataset access"),
-    ("/test",         "Estimathon trial: 20 longebench tasks, 40-slip budget"),
+    ("/test",         "Estimathon trial: 20 longebench tasks, 40-slip budget  [model]"),
     ("/exit",         "Exit the chat"),
     ("/clear",        "Clear conversation history"),
     ("/model",        "Show or set benchmark model"),
@@ -262,6 +282,30 @@ def _tool_run_benchmark(
         border_style="rgb(100,145,55)", expand=False,
     ))
 
+    # Pre-compute Estimathon totals so the progress bar has correct maxima.
+    if mode == "mixed":
+        _n_est = min(
+            len([t for t in task_list if t.get("format") in _ESTIMATHON_FORMATS]),
+            _MAX_ESTIMATHON_PROBLEMS,
+        )
+    else:
+        _n_est = len(task_list)
+    _eff_budget = budget if budget is not None else max(_n_est + 1, math.floor(18 / 13 * _n_est))
+
+    _progress = Progress(
+        SpinnerColumn(style="rgb(135,175,70)"),
+        TextColumn("[bold rgb(160,200,80)]{task.description}"),
+        BarColumn(bar_width=30, style="rgb(45,80,25)", complete_style="rgb(135,175,70)", finished_style="rgb(195,225,100)"),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+        expand=False,
+    )
+    _slip_bar = _progress.add_task("slips  ", total=_eff_budget)
+    _prob_bar = _progress.add_task("solved ", total=_n_est)
+    _solved_pids: set = set()
+
     def _slip_line(r: dict) -> None:
         good = r.get("good", False)
         wf   = r.get("width_factor")
@@ -272,7 +316,16 @@ def _tool_run_benchmark(
             f"  [dim]({attempts_left} left)[/dim]" if attempts_left is not None and attempts_left > 0
             else (f"  [yellow](locked)[/yellow]" if attempts_left == 0 else "")
         )
-        console.print(
+        # Update progress bars
+        _progress.advance(_slip_bar)
+        pid = r["pid"]
+        if good:
+            _solved_pids.add(pid)
+        else:
+            _solved_pids.discard(pid)
+        _progress.update(_prob_bar, completed=len(_solved_pids))
+
+        _progress.console.print(
             f"  [dim]#{r['slip']:02d}[/dim]  "
             f"[cyan]{r['pid']:<5}[/cyan] [dim]{display_id:<14}[/dim]  "
             f"[{'green' if good else 'red'}]{'GOOD' if good else 'BAD '}[/]"
@@ -285,10 +338,10 @@ def _tool_run_benchmark(
         question = r.get("task_content", "")
         if question:
             q_preview = question[:300].replace("\n", " ")
-            console.print(f"     [dim]Q:[/dim] [dim]{q_preview}[/dim]")
+            _progress.console.print(f"     [dim]Q:[/dim] [dim]{q_preview}[/dim]")
         raw = r.get("raw_response", "")
         if raw:
-            console.print(f"     [dim]→[/dim] [dim]{raw[:200]}[/dim]")
+            _progress.console.print(f"     [dim]→[/dim] [dim]{raw[:200]}[/dim]")
 
     def _result_line(r: dict) -> None:
         ok = r.get("correct", False)
@@ -300,7 +353,7 @@ def _tool_run_benchmark(
             f"pred=[dim]{str(r.get('pred',''))[:20]}[/dim]"
         )
 
-    with ResultWriter(output) as writer:
+    with _progress, ResultWriter(output) as writer:
         if mode == "mixed":
             result = run_mixed(
                 tasks=task_list, client=client,
@@ -313,7 +366,7 @@ def _tool_run_benchmark(
                 er = result["estimathon"]
                 ref_acc = er.get("refinement_accuracy")
                 parts.append(
-                    f"Estimathon: score={er['final_score']}  "
+                    f"Estimathon: score={_fmt_score(er['final_score'])}  "
                     f"solved={er['n_good_final']}/{er['n_problems']}  "
                     f"ref_acc={f'{ref_acc:.0%}' if ref_acc is not None else 'n/a'}"
                 )
@@ -329,7 +382,7 @@ def _tool_run_benchmark(
             ref_acc = result.get("refinement_accuracy")
             ref_str = f"{ref_acc:.0%}" if ref_acc is not None else "n/a"
             summary = (
-                f"Score: {result['final_score']}  ·  "
+                f"Score: {_fmt_score(result['final_score'])}  ·  "
                 f"Solved: {result['n_good_final']}/{result['n_problems']}  ·  "
                 f"Slips: {result['slips_used']}/{result['total_budget']}  ·  "
                 f"Refinement accuracy: {ref_str}"
@@ -481,7 +534,7 @@ def _help_panel() -> None:
     rows = [
         ("/help",         "",                        "Show this help"),
         ("/setup",        "",                        "Configure API keys + verify HuggingFace access"),
-        ("/test",         "",                        "Estimathon trial: 20 longebench tasks, 40-slip budget"),
+        ("/test",         "[model]",                  "Estimathon trial: 20 longebench tasks, 40-slip budget  (sonnet/haiku/opus or full id)"),
         ("/exit",         "",                        "Exit the chat"),
         ("/clear",        "",                        "Clear conversation history"),
         ("/model",        "[bench-model]",           "Show or set default benchmark model"),
@@ -511,11 +564,13 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
         return True
 
     if cmd == "/test":
+        model = _resolve_model(args[0]) if args else state.bench_model
         console.print(
-            "[dim]Estimathon trial — 20 longebench regression tasks, 40-slip budget…[/dim]"
+            f"[dim]Estimathon trial — 20 longebench tasks, 40-slip budget  "
+            f"·  model=[cyan]{model}[/cyan]…[/dim]"
         )
         _tool_run_benchmark(
-            model=state.bench_model,
+            model=model,
             provider=state.bench_provider,
             tasks_source="longebench",
             mode="estimathon",
