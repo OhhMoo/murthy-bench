@@ -362,14 +362,35 @@ def _isolated_problem_content(task: dict) -> str:
 
 
 def _build_isolated_system_prompt() -> str:
-    # Bare-minimum rules. Format example at the end so it's the last thing
-    # the model sees before generating.
+    # Two simultaneous pressures:
+    #   (1) Format — endpoint models often emit bare numbers ("42") or
+    #       prose. Show contrast examples so "wrong shape" is obvious.
+    #   (2) Anti-repetition — endpoint models with no chat memory will
+    #       happily re-emit the exact same interval. Make repetition a
+    #       named, forbidden failure mode at system level.
     return (
-        "Submit ONE numeric interval that contains the correct answer.\n"
-        "Wider is safer when uncertain.\n"
-        "min and max must be positive with min < max.\n"
-        "Output ONLY this single line, nothing else:\n"
-        "INTERVAL [min, max]"
+        "OUTPUT FORMAT (mandatory) — reply with ONE line, exactly this shape:\n"
+        "\n"
+        "INTERVAL [min, max]\n"
+        "\n"
+        "Where min < max and both are positive numbers.\n"
+        "\n"
+        "Examples that are CORRECT:\n"
+        "  INTERVAL [30, 90]\n"
+        "  INTERVAL [12.5, 18.0]\n"
+        "  INTERVAL [1, 1000]\n"
+        "\n"
+        "Examples that are WRONG (never output these shapes):\n"
+        "  42.0                  ← single number, missing the range\n"
+        "  The answer is 42.     ← prose / explanation\n"
+        "  INTERVAL [50, 50]     ← min must be strictly less than max\n"
+        "  INTERVAL [-3, 10]     ← min must be positive\n"
+        "\n"
+        "Hard rules:\n"
+        "- A wide CORRECT interval (e.g. INTERVAL [1, 100]) beats any wrong narrow one.\n"
+        "- NEVER repeat an interval that the user lists as FORBIDDEN. Repetition is the WORST failure mode.\n"
+        "- If a previous attempt was wrong, the correct answer is OUTSIDE that range. Move the center OR widen the range — do NOT keep the same numbers.\n"
+        "- Output nothing other than the INTERVAL line. No reasoning, no caveats, no markdown."
     )
 
 
@@ -379,33 +400,63 @@ def _build_isolated_user_message(
 ) -> str:
     content = _isolated_problem_content(task)
 
-    forbidden_block = ""
-    if wrong_intervals:
-        # FORBIDDEN goes right before the answer slot so the model sees it
-        # last — models tend to weight end-of-prompt content more heavily.
-        wrong_lines = "\n".join(f"  ✗ [{a}, {b}] — WRONG" for a, b in wrong_intervals)
-        forbidden_block = (
-            "\n\n━━━ DO NOT REPEAT THESE — already tried, all WRONG ━━━\n"
-            f"{wrong_lines}\n"
-            "The answer is NOT in any range above. Pick a DIFFERENT range."
+    if not wrong_intervals:
+        return (
+            f"{content}\n\n"
+            "Reply with ONE line in this exact format:\n"
+            "INTERVAL [min, max]"
         )
-        # Detect repeated identical submissions — model is stuck. Add a
-        # stronger nudge with a concrete alternative.
-        if len(wrong_intervals) >= 2 and wrong_intervals[-1] == wrong_intervals[-2]:
-            last_min, last_max = wrong_intervals[-1]
-            mid = (last_min + last_max) / 2
-            shift = max(abs(last_max - last_min) * 3, 20)
-            suggest_lo = max(1, mid - shift)
-            suggest_hi = mid + shift
-            forbidden_block += (
-                f"\nYou submitted the SAME interval twice. You MUST change it.\n"
-                f"Try a much wider range, e.g. INTERVAL [{suggest_lo:g}, {suggest_hi:g}]."
-            )
+
+    # Build the FORBIDDEN list with REPEAT markers for any interval that
+    # appears more than once — makes it visually obvious which exact
+    # numbers the model has been re-emitting.
+    seen: set = set()
+    wrong_lines = []
+    has_repeat = False
+    for a, b in wrong_intervals:
+        if (a, b) in seen:
+            wrong_lines.append(f"  ✗ [{a}, {b}]   ← REPEAT — never submit this again")
+            has_repeat = True
+        else:
+            wrong_lines.append(f"  ✗ [{a}, {b}]")
+            seen.add((a, b))
+
+    # Concrete alternative ranges, derived from the bounding box of all
+    # forbidden intervals. Models that ignore prose still often copy
+    # explicit example numbers, so each suggestion must be visibly
+    # different from anything in the forbidden list.
+    lo_all = min(a for a, _ in wrong_intervals)
+    hi_all = max(b for _, b in wrong_intervals)
+    # Aggressive widening: 5× the current span (or 30, whichever is bigger)
+    # so the "wider" suggestion is unmistakably broader than the forbidden
+    # band, not just nudged a few units outward.
+    span = max((hi_all - lo_all) * 5, 30.0)
+    suggest_wider = f"INTERVAL [{max(1, lo_all - span):g}, {hi_all + span:g}]"
+    suggest_below = f"INTERVAL [{max(1, lo_all * 0.2):g}, {max(1.5, lo_all * 0.7):g}]"
+    suggest_above = f"INTERVAL [{hi_all * 1.3:g}, {hi_all * 3:g}]"
+
+    repeat_warning = ""
+    if has_repeat:
+        repeat_warning = (
+            "\n⚠  You have ALREADY submitted the same interval more than once "
+            "for this problem. Repeating it AGAIN is forbidden — change the numbers."
+        )
 
     return (
-        f"{content}"
-        f"{forbidden_block}\n\n"
-        "Your interval:\nINTERVAL [min, max]"
+        f"{content}\n\n"
+        "━━━ FORBIDDEN INTERVALS for this problem ━━━\n"
+        f"{chr(10).join(wrong_lines)}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "The correct answer is OUTSIDE every range above.\n"
+        "Your new INTERVAL MUST differ from every line above — "
+        "shift the center OR widen the range."
+        f"{repeat_warning}\n\n"
+        "Concrete options you may pick (any DIFFERENT range works):\n"
+        f"  • {suggest_wider}   ← much wider\n"
+        f"  • {suggest_below}   ← shifted lower\n"
+        f"  • {suggest_above}   ← shifted higher\n\n"
+        "Reply with ONE line in this exact format:\n"
+        "INTERVAL [min, max]"
     )
 
 
