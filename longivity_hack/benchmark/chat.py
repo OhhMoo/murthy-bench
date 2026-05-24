@@ -25,6 +25,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import config as cfg
+from . import client as client_module
 from .client import ModelClient
 from .loader import load_tasks
 from .model_manager import ModelManager
@@ -93,6 +94,7 @@ _SLASH_META = [
     ("/provider",     "Show or set provider  (anthropic|openai|hf|endpoint)"),
     ("/tasks",        "Show or set default task source"),
     ("/think",        "Toggle chain-of-thought traces"),
+    ("/cheat",        "Toggle cheat mode — print every API request and raw response"),
     ("/explore",      "Show all unique task types in LongeBench (regression only)"),
     ("/question_set", "Preview tasks from a source"),
     ("/benchmark",    "Quick-run estimathon with current defaults"),
@@ -131,6 +133,7 @@ class ChatState:
     bench_model:      str  = "claude-haiku-4-5-20251001"
     bench_provider:   str  = "anthropic"
     think_mode:       bool = False
+    cheat_mode:       bool = False
     default_tasks:    str  = "sample"
     conversation:     list = field(default_factory=list)
 
@@ -649,6 +652,7 @@ def _help_panel() -> None:
         ("/provider",     "[provider]",              "Show or set default provider  (anthropic|openai|hf|endpoint)"),
         ("/tasks",        "[source]",                "Show or set default task source  (sample|longebench|<path>)"),
         ("/think",        "",                        "Toggle chain-of-thought traces for benchmark runs"),
+        ("/cheat",        "",                        "Toggle cheat mode — print every API request + raw response"),
         ("/explore",      "",                        "Show all unique task types in LongeBench (scans first 3000 rows)"),
         ("/question_set", "[source] [limit]",        "Preview tasks from a source"),
         ("/benchmark",    "[model] [provider] [tasks]","Quick-run estimathon with current defaults"),
@@ -705,6 +709,18 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
     if cmd == "/think":
         state.think_mode = not state.think_mode
         console.print(f"[green]●[/green] Think mode [bold]{'ON' if state.think_mode else 'OFF'}[/bold]")
+        return True
+
+    if cmd == "/cheat":
+        state.cheat_mode = not state.cheat_mode
+        client_module.set_cheat(state.cheat_mode)
+        if state.cheat_mode:
+            console.print(
+                "[red]●[/red] Cheat mode [bold red]ON[/bold red]  "
+                "[dim]— every API request + raw response will be printed[/dim]"
+            )
+        else:
+            console.print("[green]●[/green] Cheat mode [bold]OFF[/bold]")
         return True
 
     if cmd == "/model":
@@ -1002,14 +1018,30 @@ def run_chat(chat_model: str = "claude-sonnet-4-6", api_key: str | None = None) 
 
         # Agentic tool-use loop
         while True:
-            with _thinking("Thinking"):
-                response = anthropic_client.messages.create(
-                    model=state.chat_model,
-                    max_tokens=4096,
-                    system=_SYSTEM,
-                    tools=_TOOLS,
-                    messages=state.conversation,
+            chat_kwargs = dict(
+                model=state.chat_model,
+                max_tokens=4096,
+                system=_SYSTEM,
+                tools=_TOOLS,
+                messages=state.conversation,
+            )
+            if state.cheat_mode:
+                client_module._cheat_dump(
+                    f"REQUEST  chat-orchestrator → {state.chat_model}", chat_kwargs
                 )
+            with _thinking("Thinking"):
+                response = anthropic_client.messages.create(**chat_kwargs)
+            if state.cheat_mode:
+                try:
+                    client_module._cheat_dump(
+                        f"RAW RESPONSE  chat-orchestrator ← {state.chat_model}",
+                        response.model_dump(),
+                    )
+                except Exception as exc:
+                    client_module._cheat_dump(
+                        f"RAW RESPONSE  chat-orchestrator ← {state.chat_model}",
+                        {"dump_error": str(exc), "stop_reason": getattr(response, "stop_reason", None)},
+                    )
 
             if response.stop_reason == "end_turn":
                 text = "".join(b.text for b in response.content if hasattr(b, "text"))
