@@ -296,6 +296,171 @@ def _parse_estimathon_response(text: str) -> tuple[int | None, float | None, flo
     return None, None, None
 
 
+# ---------------------------------------------------------------------------
+# Isolated-context Estimathon — one problem per API call
+# ---------------------------------------------------------------------------
+#
+# Designed for smaller models (e.g. L-LLM on a HF endpoint) that drown in the
+# accumulating shared-budget conversation used by run_estimathon. Each slip is
+# a FRESH single-turn API call containing only:
+#   - compact rules
+#   - the ONE problem being attempted (full text)
+#   - prior wrong intervals on THIS problem (if any)
+#   - slips remaining
+# Round-robin scheduler picks the next unlocked problem.
+
+def _build_isolated_system_prompt() -> str:
+    return (
+        "You are answering a scientific estimation problem with a numeric interval.\n\n"
+        "Rules:\n"
+        "- Submit ONE interval [min, max] containing the correct answer.\n"
+        "- Wider is safer when uncertain: a GOOD wide interval is FAR better than any BAD.\n"
+        "- min and max must be positive numbers with min < max.\n\n"
+        "OUTPUT FORMAT — MANDATORY:\n"
+        "Your entire response must be ONLY this single line. No explanation. No reasoning.\n\n"
+        "INTERVAL [min, max]\n\n"
+        "Example: INTERVAL [30, 90]"
+    )
+
+
+def _build_isolated_user_message(
+    task: dict, pid: str, problem_num: int,
+    wrong_intervals: list[tuple[float, float]], slips_remaining: int,
+) -> str:
+    domain = task.get("domain", "")
+    metric = task.get("metric", "")
+    content = _problem_content(task)
+
+    wrong_block = ""
+    if wrong_intervals:
+        wrong_lines = "\n".join(f"  [{a}, {b}]" for a, b in wrong_intervals)
+        wrong_block = (
+            "\n\nYour previous attempts on this problem were WRONG "
+            "(the answer is NOT in any of these intervals):\n"
+            f"{wrong_lines}\n"
+            "Submit a DIFFERENT interval. Consider widening to be safe."
+        )
+
+    return (
+        f"Problem {problem_num}  [{domain}  |  {metric}]\n\n"
+        f"{content}"
+        f"{wrong_block}\n\n"
+        f"Slips remaining (across all problems): {slips_remaining}\n\n"
+        "Submit your interval:\nINTERVAL [min, max]"
+    )
+
+
+def _build_estimathon_result(session: EstimathonSession, n: int, total_budget: int, mode_label: str) -> dict:
+    refinements = [r for r in session.slip_log if r["was_refinement"] and r["prev_was_good"]]
+    ref_success = sum(1 for r in refinements if r["good"])
+    ref_total = len(refinements)
+    return {
+        "mode": mode_label,
+        "n_problems": n,
+        "total_budget": total_budget,
+        "slips_used": session.slips_used,
+        "final_score": session.current_score(),
+        "n_good_final": sum(
+            1 for pid, (pmin, pmax) in session.last_submissions.items()
+            if session.golds.get(pid) is not None
+            and pmin <= session.golds[pid] <= pmax
+        ),
+        "refinement_attempts": ref_total,
+        "refinement_successes": ref_success,
+        "refinement_accuracy": ref_success / ref_total if ref_total else None,
+        "slip_log": session.slip_log,
+    }
+
+
+def run_estimathon_isolated(
+    tasks: list[dict],
+    client: ModelClient,
+    total_budget: int | None = None,
+    enable_thinking: bool = False,
+    on_slip: Callable[[dict], None] | None = None,
+) -> dict:
+    """Per-problem single-turn variant. Each slip = one fresh API call with
+    only the target problem + its prior wrong intervals. Round-robin picks
+    the next unlocked problem so the model never has to choose."""
+    n = len(tasks)
+    if total_budget is None:
+        total_budget = max(n + 1, math.floor(18 / 13 * n))
+
+    session = EstimathonSession(tasks=tasks, total_budget=total_budget)
+    for i, task in enumerate(tasks):
+        pid = f"P{i + 1}"
+        gold = _extract_gold(task)
+        if gold is not None:
+            session.golds[pid] = gold
+
+    cursor = 0
+    parse_failures = 0
+
+    while session.slips_remaining > 0:
+        # Round-robin to the next problem that still has attempts left.
+        start = cursor
+        while True:
+            pid = f"P{cursor + 1}"
+            if session.per_problem_slips.get(pid, 0) < _MAX_SLIPS_PER_PROBLEM:
+                break
+            cursor = (cursor + 1) % n
+            if cursor == start:
+                # All problems locked — nothing more to do.
+                return _build_estimathon_result(session, n, total_budget, "estimathon-iso")
+
+        task_idx = cursor
+        task = tasks[task_idx]
+
+        messages = [
+            {"role": "system", "content": _build_isolated_system_prompt()},
+            {"role": "user", "content": _build_isolated_user_message(
+                task, pid, cursor + 1,
+                session.tried_intervals.get(pid, []),
+                session.slips_remaining,
+            )},
+        ]
+
+        try:
+            resp = client.chat(
+                messages,
+                max_tokens=3000 if enable_thinking else 120,
+                temperature=0.0,
+                enable_thinking=enable_thinking,
+            )
+        except Exception as exc:
+            print(f"\n[Estimathon-iso] API error: {exc}. Returning partial results.")
+            break
+
+        pmin, pmax = parse_interval(resp.answer)
+        if pmin is None or pmax is None or pmin <= 0 or pmax <= pmin:
+            parse_failures += 1
+            if parse_failures >= 3:
+                print(f"\n[Estimathon-iso] 3 consecutive parse failures. Returning partial results.")
+                break
+            cursor = (cursor + 1) % n  # skip this problem this round
+            continue
+        parse_failures = 0
+
+        session.per_problem_slips[pid] = session.per_problem_slips.get(pid, 0) + 1
+        attempts_used = session.per_problem_slips[pid]
+        attempts_left = _MAX_SLIPS_PER_PROBLEM - attempts_used
+
+        result = session.submit(pid, pmin, pmax)
+        result["think"] = resp.think
+        result["raw_response"] = resp.answer
+        result["task_content"] = _problem_content(task)
+        result["lb_id"] = task.get("lb_id", pid)
+        result["attempts_used"] = attempts_used
+        result["attempts_left"] = attempts_left
+
+        if on_slip:
+            on_slip(result)
+
+        cursor = (cursor + 1) % n
+
+    return _build_estimathon_result(session, n, total_budget, "estimathon-iso")
+
+
 def run_estimathon(
     tasks: list[dict],
     client: ModelClient,
@@ -657,6 +822,7 @@ def run_mixed(
     extractor: "ModelClient | None" = None,
     on_slip: Callable[[dict], None] | None = None,
     on_result: Callable[[dict], None] | None = None,
+    isolated: bool = False,
 ) -> dict:
     """
     Split tasks by format:
@@ -682,14 +848,23 @@ def run_mixed(
 
     # --- Track 1: Estimathon ---
     if numerical:
-        estimathon_result = run_estimathon(
-            tasks=numerical,
-            client=client,
-            total_budget=total_budget,
-            enable_thinking=enable_thinking,
-            extractor=extractor,
-            on_slip=on_slip,
-        )
+        if isolated:
+            estimathon_result = run_estimathon_isolated(
+                tasks=numerical,
+                client=client,
+                total_budget=total_budget,
+                enable_thinking=enable_thinking,
+                on_slip=on_slip,
+            )
+        else:
+            estimathon_result = run_estimathon(
+                tasks=numerical,
+                client=client,
+                total_budget=total_budget,
+                enable_thinking=enable_thinking,
+                extractor=extractor,
+                on_slip=on_slip,
+            )
 
     # --- Track 2: one-shot categorical ---
     if categorical:

@@ -31,7 +31,7 @@ from .loader import load_tasks
 from .model_manager import ModelManager
 from .results import ResultWriter
 from .runner import (
-    run_estimathon, run_eval, run_mixed,
+    run_estimathon, run_estimathon_isolated, run_eval, run_mixed,
     _fmt_score, _MAX_ESTIMATHON_PROBLEMS, _ESTIMATHON_FORMATS,
 )
 
@@ -456,14 +456,23 @@ def _tool_run_benchmark(
     if not task_list:
         return "No tasks loaded."
 
+    # Smaller models on a local/HF endpoint drown in the shared-budget
+    # conversation. Auto-switch to isolated per-problem context for them.
+    use_isolated = (provider == "endpoint") and mode in ("estimathon", "mixed")
+
     console.print(Panel(
         f"[green]Model:[/green] [cyan]{model}[/cyan]   "
         f"[green]Provider:[/green] {provider}   "
-        f"[green]Mode:[/green] {mode}   "
+        f"[green]Mode:[/green] {mode}{' [yellow](isolated context)[/yellow]' if use_isolated else ''}   "
         f"[green]Tasks:[/green] {len(task_list)}   "
         f"[green]Think:[/green] {think}",
         border_style="rgb(100,145,55)", expand=False,
     ))
+    if use_isolated:
+        console.print(
+            "  [dim yellow]→ endpoint provider: sending one problem per API call "
+            "(no shared conversation) to keep prompt small[/dim yellow]"
+        )
 
     # Pre-compute Estimathon totals so the progress bar has correct maxima.
     if mode == "mixed":
@@ -544,6 +553,7 @@ def _tool_run_benchmark(
                 tasks=task_list, client=client,
                 total_budget=budget, enable_thinking=think,
                 on_slip=_slip_line, on_result=_result_line,
+                isolated=use_isolated,
             )
             writer.write(result)
             parts = []
@@ -561,8 +571,14 @@ def _tool_run_benchmark(
             summary = "  |  ".join(parts) if parts else "no results"
 
         elif mode == "estimathon":
-            result = run_estimathon(tasks=task_list, client=client,
-                                    total_budget=budget, enable_thinking=think, on_slip=_slip_line)
+            if use_isolated:
+                result = run_estimathon_isolated(
+                    tasks=task_list, client=client,
+                    total_budget=budget, enable_thinking=think, on_slip=_slip_line,
+                )
+            else:
+                result = run_estimathon(tasks=task_list, client=client,
+                                        total_budget=budget, enable_thinking=think, on_slip=_slip_line)
             writer.write(result)
             ref_acc = result.get("refinement_accuracy")
             ref_str = f"{ref_acc:.0%}" if ref_acc is not None else "n/a"
