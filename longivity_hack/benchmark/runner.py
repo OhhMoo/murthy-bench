@@ -1,6 +1,7 @@
 import math
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Iterator
@@ -168,6 +169,8 @@ Optimal play:
            When uncertain, start very wide: e.g. [1, 1000] or [10, 100000].
   Step 2 — Narrow only when confident: use remaining slips to tighten the interval.
            Only submit a narrow interval if you are sure it contains the answer.
+           IMPORTANT: a refinement must have a SMALLER max/min ratio than your current GOOD interval.
+           Submitting a WIDER interval for a problem you already have GOOD always worsens your score.
   Step 3 — Cover all problems: spread slips across problems before refining any one.
 
 You receive ONLY binary feedback: GOOD or BAD. No directional hints.
@@ -193,7 +196,10 @@ def _build_standings(session: EstimathonSession) -> str:
             pmin, pmax = session.last_submissions[pid]
             is_good = gold is not None and pmin <= gold <= pmax
             wf = math.floor(pmax / pmin) if is_good and pmin > 0 else None
-            status = f"GOOD  width={wf}" if is_good else "BAD"
+            if is_good:
+                status = f"GOOD  width={wf}  (score contribution: {wf})"
+            else:
+                status = "BAD"
             lines.append(f"  [{i+1:2d}] [{pmin}, {pmax}]  →  {status}")
         else:
             lines.append(f"  [{i+1:2d}] —  no submission yet")
@@ -237,6 +243,11 @@ def _build_feedback(result: dict, session: EstimathonSession) -> str:
             "\n⚠  You had a GOOD interval for this problem. "
             "Your new BAD submission replaced it — this problem now counts as wrong."
         )
+    elif result["was_refinement"] and result["prev_was_good"] and result["good"] and result["score_after"] > result["score_before"]:
+        warning = (
+            "\n⚠  Your new interval is WIDER than your previous GOOD interval — this WORSENED your score. "
+            "To improve, submit a NARROWER interval (smaller max/min ratio) than what you had before."
+        )
 
     score_line = f"Score: {_fmt_score(result['score_before'])} → {_fmt_score(result['score_after'])}"
     if result["score_after"] < result["score_before"]:
@@ -257,8 +268,44 @@ def _build_feedback(result: dict, session: EstimathonSession) -> str:
     if session.slips_remaining == 0:
         next_prompt = "No slips remaining. Session complete."
     else:
+        unsolved = []
+        can_narrow = []
+        for i, t in enumerate(session.tasks):
+            _pid = t.get("lb_id", f"P{i+1}")
+            _gold = session.golds.get(_pid)
+            if _pid not in session.last_submissions:
+                unsolved.append(i + 1)
+            else:
+                _mn, _mx = session.last_submissions[_pid]
+                _is_good = _gold is not None and _mn <= _gold <= _mx
+                if not _is_good:
+                    unsolved.append(i + 1)
+                else:
+                    _wf = math.floor(_mx / _mn) if _mn > 0 else None
+                    if _wf and _wf > 1:
+                        can_narrow.append((i + 1, _mn, _mx, _wf))
+
+        guidance_lines = []
+        if unsolved:
+            guidance_lines.append(
+                f"PRIORITY — unsolved problems (submit wide to secure GOOD): {unsolved}"
+            )
+        if can_narrow:
+            guidance_lines.append(
+                "REFINEMENT opportunities (submit a NARROWER interval to lower your score):"
+            )
+            for pnum, mn, mx, wf in can_narrow:
+                guidance_lines.append(
+                    f"  Problem {pnum}: current [{mn}, {mx}] width={wf} — "
+                    f"submit smaller max/min ratio to reduce score contribution"
+                )
+        if not unsolved and not can_narrow:
+            guidance_lines.append("All problems solved and fully refined.")
+
+        guidance = "\n".join(guidance_lines)
         next_prompt = (
             f"Slips remaining: {session.slips_remaining}\n\n"
+            f"{guidance}\n\n"
             "Next submission:\n"
             "PROBLEM <number>\n"
             "INTERVAL [min, max]"
@@ -340,20 +387,47 @@ def run_estimathon(
             )
         except Exception as exc:
             msg = str(exc).lower()
-            if "rate_limit" in msg or "429" in msg:
+            is_rate_limit = "rate_limit" in msg or "429" in msg
+            is_too_large = "too large" in msg or "request too large" in msg
+            if is_rate_limit and is_too_large:
+                # Request itself exceeds TPM limit — retrying won't help, need fewer tasks
+                est_tokens = sum(len(m.get("content", "")) for m in conversation) // 4
                 print(
-                    f"\n[Estimathon] Rate limit hit after {session.slips_used} slips. "
-                    f"Use --limit to run fewer tasks (current: {n} problems). "
-                    f"Returning partial results."
+                    f"\n[Estimathon] Request too large (~{est_tokens} tokens). "
+                    f"Current session has {n} problems. "
+                    f"Use --limit to reduce (e.g. --limit {max(1, n // 2)}) and retry."
                 )
+                break
+            elif is_rate_limit:
+                gave_up = False
+                for attempt in range(1, 5):
+                    wait = 15 * attempt
+                    print(f"\n[Estimathon] Rate limit hit — waiting {wait}s (attempt {attempt}/4)...")
+                    time.sleep(wait)
+                    try:
+                        resp = client.chat(
+                            conversation,
+                            max_tokens=3000 if enable_thinking else 120,
+                            temperature=0.0,
+                            enable_thinking=enable_thinking,
+                        )
+                        break
+                    except Exception as retry_exc:
+                        if attempt == 4:
+                            print(f"\n[Estimathon] Rate limit persists after 4 retries. Returning partial results.")
+                            gave_up = True
+                        exc = retry_exc
+                if gave_up:
+                    break
             elif "context" in msg or "too long" in msg or "token" in msg:
                 print(
                     f"\n[Estimathon] Context too long ({n} problems). "
                     f"Use --limit to cap tasks. Returning partial results."
                 )
+                break
             else:
                 print(f"\n[Estimathon] API error: {exc}. Returning partial results.")
-            break
+                break
 
         problem_num, pmin, pmax = _parse_estimathon_response(resp.answer)
 
@@ -587,12 +661,30 @@ def _run_one_shot(
     gold = messages[-1]["content"].strip()
     fmt = task.get("format", "")
     call_messages = _inject_format_reminder(messages[:-1], fmt)
-    resp = client.chat(
-        call_messages,
-        max_tokens=3000 if enable_thinking else 200,
-        temperature=0.0,
-        enable_thinking=enable_thinking,
-    )
+    try:
+        resp = client.chat(
+            call_messages,
+            max_tokens=3000 if enable_thinking else 200,
+            temperature=0.0,
+            enable_thinking=enable_thinking,
+        )
+    except Exception as exc:
+        return {
+            "lb_id": task.get("lb_id", ""),
+            "domain": task.get("domain", ""),
+            "format": fmt,
+            "metric": task.get("metric", ""),
+            "mode": "one-shot",
+            "error": str(exc),
+            "input_messages": call_messages,
+            "raw_response": None,
+            "pred": None,
+            "gold": gold,
+            "correct": None,
+            "think": None,
+            "tokens_used": 0,
+        }
+    raw_response = (resp.think or "") + resp.answer if resp.think else resp.answer
     pred = resp.answer.strip()
     if extractor is not None and not _looks_like_answer(pred, fmt):
         pred = _extract_answer(pred, fmt, extractor)
@@ -602,7 +694,10 @@ def _run_one_shot(
         "domain": task.get("domain", ""),
         "format": fmt,
         "metric": task.get("metric", ""),
+        "task": task.get("task", ""),
         "mode": "one-shot",
+        "input_messages": call_messages,
+        "raw_response": raw_response,
         "gold": gold,
         "pred": pred,
         "correct": correct,

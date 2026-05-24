@@ -88,7 +88,8 @@ class ModelClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
+        if self.provider != "openai":
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
         if enable_thinking:
             kwargs["max_tokens"] = max(max_tokens, 3000)
 
@@ -109,12 +110,15 @@ class ModelClient:
         user_msgs = [m for m in messages if m["role"] != "system"]
         system_text = system_msgs[0]["content"] if system_msgs else None
 
+        # Opus 4+ models deprecate temperature (they use extended thinking internally)
+        _no_temp_models = {"claude-opus-4-7", "claude-opus-4-6"}
         kwargs: dict = {
             "model": self.model_id,
             "max_tokens": max_tokens,
-            "temperature": temperature,
             "messages": user_msgs,
         }
+        if self.model_id not in _no_temp_models:
+            kwargs["temperature"] = temperature
         if system_text:
             kwargs["system"] = system_text
 

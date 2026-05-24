@@ -543,7 +543,7 @@ def group_remove(
 def compare(
     group: str = typer.Option(..., "--group", "-g", help="Named model group to compare"),
     tasks: str = typer.Option("longebench", "--tasks", "-t", help='"longebench", "longebench:extra", or path to .jsonl'),
-    mode: EvalMode = typer.Option(EvalMode.one_shot, "--mode", help="one-shot | mixed"),
+    mode: EvalMode = typer.Option(EvalMode.one_shot, "--mode", help="one-shot | estimathon | mixed"),
     output: Path = typer.Option(Path("compare_results.jsonl"), "--output", "-o"),
     concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=8),
     budget: Optional[int] = typer.Option(None, "--budget", "-b", help="Estimathon slip budget (default: auto floor(18/13 × N))"),
@@ -557,7 +557,12 @@ def compare(
         raise typer.Exit(1)
 
     try:
-        task_list = load_tasks(tasks, limit=limit)
+        task_list = load_tasks(
+            tasks,
+            limit=limit,
+            estimathon=(mode == EvalMode.estimathon),
+            mixed=(mode == EvalMode.mixed),
+        )
     except (FileNotFoundError, ImportError) as exc:
         console.print(f"[red]Error loading tasks:[/red] {exc}")
         raise typer.Exit(1)
@@ -572,6 +577,8 @@ def compare(
         )
     )
 
+    # Column schema depends on mode
+    is_estimathon = (mode == EvalMode.estimathon)
     summary_rows: list[tuple] = []
 
     with ResultWriter(str(output)) as writer:
@@ -580,7 +587,6 @@ def compare(
             model_id = entry["model"]
             prov = entry["provider"]
 
-            # Resolve endpoint for L-LLM shorthand
             ep_url: str | None = entry.get("endpoint")
             if prov == "endpoint" and not ep_url:
                 ep_url = cfg.get("llm.endpoint")
@@ -608,18 +614,42 @@ def compare(
                     n_correct += 1
                 total_tokens += record.get("tokens_used", 0)
 
-            with Progress(
-                SpinnerColumn(), TextColumn("{task.description}"),
-                BarColumn(), TaskProgressColumn(),
-                console=console, transient=True,
-            ) as prog:
-                ptask = prog.add_task(f"Evaluating {label}...", total=len(task_list))
+            if mode == EvalMode.estimathon:
+                def _on_slip(record: dict):
+                    record["model_label"] = label
+                    writer.write(record)
 
-                def _on_result_tracked(record: dict, _ptask=ptask):
-                    _on_result(record)
-                    prog.advance(_ptask)
+                session_result = run_estimathon(
+                    tasks=task_list,
+                    client=client,
+                    total_budget=budget,
+                    enable_thinking=think,
+                    on_slip=_on_slip,
+                )
+                session_result["model_label"] = label
+                writer.write(session_result)
+                final_score = session_result["final_score"]
+                n_good = session_result["n_good_final"]
+                n_problems = session_result["n_problems"]
+                slips = session_result["slips_used"]
+                summary_rows.append((label, n_problems, n_good, final_score, slips))
+                console.print(
+                    f"  {label}: score={_fmt_score(final_score)}  "
+                    f"solved={n_good}/{n_problems}  slips={slips}"
+                )
 
-                if mode == EvalMode.mixed:
+            elif mode == EvalMode.mixed:
+                with Progress(
+                    SpinnerColumn(), TextColumn("{task.description}"),
+                    BarColumn(), TaskProgressColumn(),
+                    console=console, transient=True,
+                ) as prog:
+                    ptask = prog.add_task(f"Evaluating {label}...", total=len(task_list))
+
+                    def _on_result_tracked(record: dict, _ptask=ptask):
+                        _on_result(record)
+                        prog.advance(_ptask)
+
                     mixed_result = run_mixed(
                         tasks=task_list,
                         client=client,
@@ -630,7 +660,24 @@ def compare(
                     )
                     mixed_result["model_label"] = label
                     writer.write(mixed_result)
-                else:
+
+                avg_tok = total_tokens // n_tasks if n_tasks else 0
+                acc = n_correct / n_tasks if n_tasks else 0.0
+                summary_rows.append((label, n_tasks, n_correct, acc, avg_tok))
+                console.print(f"  {label}: {n_correct}/{n_tasks} correct  ({acc:.1%})  avg {avg_tok} tok")
+
+            else:
+                with Progress(
+                    SpinnerColumn(), TextColumn("{task.description}"),
+                    BarColumn(), TaskProgressColumn(),
+                    console=console, transient=True,
+                ) as prog:
+                    ptask = prog.add_task(f"Evaluating {label}...", total=len(task_list))
+
+                    def _on_result_tracked(record: dict, _ptask=ptask):
+                        _on_result(record)
+                        prog.advance(_ptask)
+
                     run_eval(
                         tasks=iter(task_list),
                         client=client,
@@ -639,22 +686,29 @@ def compare(
                         on_result=_on_result_tracked,
                     )
 
-            avg_tok = total_tokens // n_tasks if n_tasks else 0
-            acc = n_correct / n_tasks if n_tasks else 0.0
-            summary_rows.append((label, n_tasks, n_correct, acc, avg_tok))
-            console.print(
-                f"  {label}: {n_correct}/{n_tasks} correct  ({acc:.1%})  avg {avg_tok} tok"
-            )
+                avg_tok = total_tokens // n_tasks if n_tasks else 0
+                acc = n_correct / n_tasks if n_tasks else 0.0
+                summary_rows.append((label, n_tasks, n_correct, acc, avg_tok))
+                console.print(f"  {label}: {n_correct}/{n_tasks} correct  ({acc:.1%})  avg {avg_tok} tok")
 
     # Final comparison table
     table = Table(title="[bold]Comparison Summary[/bold]", show_lines=True)
-    table.add_column("Model", style="cyan")
-    table.add_column("Tasks", justify="right")
-    table.add_column("Correct", justify="right")
-    table.add_column("Accuracy", justify="right", style="bold")
-    table.add_column("Avg Tokens", justify="right")
-    for label, n_tasks, n_correct, acc, avg_tok in summary_rows:
-        table.add_row(label, str(n_tasks), str(n_correct), f"{acc:.1%}", str(avg_tok))
+    if is_estimathon:
+        table.add_column("Model", style="cyan")
+        table.add_column("Problems", justify="right")
+        table.add_column("Solved", justify="right")
+        table.add_column("Score", justify="right", style="bold")
+        table.add_column("Slips", justify="right")
+        for label, n_problems, n_good, final_score, slips in summary_rows:
+            table.add_row(label, str(n_problems), str(n_good), _fmt_score(final_score), str(slips))
+    else:
+        table.add_column("Model", style="cyan")
+        table.add_column("Tasks", justify="right")
+        table.add_column("Correct", justify="right")
+        table.add_column("Accuracy", justify="right", style="bold")
+        table.add_column("Avg Tokens", justify="right")
+        for label, n_tasks, n_correct, acc, avg_tok in summary_rows:
+            table.add_row(label, str(n_tasks), str(n_correct), f"{acc:.1%}", str(avg_tok))
     console.print("\n")
     console.print(table)
     console.print(f"\n[dim]Full results → {output}[/dim]")
