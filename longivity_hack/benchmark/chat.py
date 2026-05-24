@@ -584,14 +584,14 @@ def _tool_run_benchmark(
             summary = "  |  ".join(parts) if parts else "no results"
 
         elif mode == "estimathon":
-            if use_isolated:
-                result = run_estimathon_isolated(
-                    tasks=task_list, client=client,
-                    total_budget=budget, enable_thinking=think, on_slip=_slip_line,
-                )
-            else:
-                result = run_estimathon(tasks=task_list, client=client,
-                                        total_budget=budget, enable_thinking=think, on_slip=_slip_line)
+            # use_isolated is always True for this mode (set above) — every
+            # provider runs in isolated per-problem context for apples-to-
+            # apples comparison. Legacy run_estimathon kept in runner.py
+            # for archaeology but no longer called from any path.
+            result = run_estimathon_isolated(
+                tasks=task_list, client=client,
+                total_budget=budget, enable_thinking=think, on_slip=_slip_line,
+            )
             writer.write(result)
             ref_acc = result.get("refinement_accuracy")
             ref_str = f"{ref_acc:.0%}" if ref_acc is not None else "n/a"
