@@ -187,8 +187,9 @@ Results written to `results.jsonl`. Fields include:
 
 ```
 longivity_hack/
-├── cli.py                  Typer entry point
-├── idea.md                 Benchmark design document
+├── cli.py                  Typer entry point (run / chat / status / tasks / config / group / compare)
+├── hf_llm_models.csv       300+ HuggingFace models for /model search and /add refresh
+├── idea.md                 Benchmark design rationale
 ├── devlog.md               Development log
 ├── CLAUDE.md               Developer guide for contributors
 └── benchmark/
@@ -197,5 +198,8 @@ longivity_hack/
     ├── loader.py           Task loading — sample / LongeBench / local JSONL
     ├── client.py           Unified model client (all providers)
     ├── config.py           ~/.longevity/config.json
-    └── results.py          JSONL writer / reader
+    ├── results.py          JSONL writer / reader
+    └── model_manager.py    CSV-backed model browser (/model, /add, /batch)
 ```
+
+For a local dev setup (cloning and running from source), see [SETUP.md](SETUP.md).

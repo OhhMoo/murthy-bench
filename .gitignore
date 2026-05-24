@@ -6,8 +6,10 @@ dist/
 build/
 *.egg-info/
 *.jsonl
+.env
+.env.local
 
-# LaTeX build artifacts
+# LaTeX / document build artifacts
 *.aux
 *.log
 *.out
@@ -15,3 +17,8 @@ build/
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+*.pdf
+*.tex
+
+# Misc run artifacts
+benchmark_summary_*.csv
