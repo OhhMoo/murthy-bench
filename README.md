@@ -10,73 +10,82 @@ Non-numerical tasks (binary, multiclass, ternary, generation) are scored with st
 ## Install
 
 ```bash
-cd longivity_hack
-pip install -r requirements.txt
+pip install murthy-bench
 ```
 
 ---
 
-## First-time setup
-
-Run the setup wizard inside the chat to configure keys and verify dataset access:
+## Quick start
 
 ```bash
-python cli.py
+murthy
 ```
 
-Then type:
-
-```
-/setup
-```
+On first launch, Murphy runs a setup wizard to configure your API keys and verify dataset access.
+Keys are saved to `~/.longevity/config.json` and masked on input.
 
 The wizard walks through:
 1. **Anthropic API key** — required for the chat interface and `--provider anthropic` runs
 2. **HuggingFace token** — required for LongeBench dataset; wizard verifies live access
 3. **OpenAI API key** — optional
 
-Keys are saved to `~/.longevity/config.json` and masked on input.
-
-> **LongeBench is a gated dataset.** Before your token will work, visit
+> **LongeBench is a gated dataset.** Before your HF token will work, visit
 > `huggingface.co/datasets/insilicomedicine/longebench` and click **Request access**.
-> Approval is usually instant. Then re-run `/setup` to verify.
+> Approval is usually instant. Then re-run `/setup` to re-verify.
+
+You can re-run setup at any time from inside the chat:
+
+```
+/setup
+```
 
 ---
 
-## Interactive chat (recommended)
+## Set keys manually
 
 ```bash
-python cli.py          # opens chat directly
-python cli.py chat     # same thing
+murthy config set anthropic.api_key  sk-ant-...
+murthy config set hf.token           hf_...
+murthy config list
+```
+
+---
+
+## Interactive chat
+
+```bash
+murthy
 ```
 
 Type naturally — Claude calls the right tools. Type `/` to see all commands with Tab autocomplete.
 
 | Command | Args | Description |
 |---|---|---|
-| `/setup` | | Configure API keys + verify HuggingFace access |
+| `/setup` | | Re-run the API key wizard |
 | `/help` | | Show all commands |
+| `/test` | `[model]` | Estimathon trial: 20 LongeBench tasks, 40-slip budget |
 | `/benchmark` | `[model] [provider] [tasks]` | Quick-run with current defaults |
+| `/explore` | | Show all unique LongeBench task types + Estimathon compatibility |
 | `/question_set` | `[source] [limit]` | Preview tasks |
-| `/status` | `[model] [provider]` | Check model connectivity |
-| `/model` | `[id]` | Show or set benchmark model |
+| `/model` | `list \| search \| <id>` | List, search, or set benchmark model |
+| `/batch` | `<models> [provider]` | Benchmark multiple models in sequence |
+| `/add` | `<model_id> \| refresh` | Add model to list or refresh from HuggingFace |
 | `/provider` | `[name]` | Show or set provider |
 | `/tasks` | `[source]` | Show or set default task source |
 | `/think` | | Toggle chain-of-thought traces |
+| `/status` | `[model] [provider]` | Check model connectivity |
 | `/config` | `[key] [value]` | View or set a config value |
 | `/clear` | | Clear conversation history |
 | `/exit` | | Exit |
 
 ---
 
-## Running benchmarks
+## Running benchmarks (CLI)
 
 ### Full LongeBench — mixed mode (recommended)
 
-Runs Estimathon on numerical tasks and one-shot accuracy on categorical tasks:
-
 ```bash
-python cli.py run \
+murthy run \
   --model claude-sonnet-4-6 \
   --provider anthropic \
   --tasks longebench \
@@ -87,7 +96,7 @@ python cli.py run \
 ### Estimathon only (numerical tasks)
 
 ```bash
-python cli.py run \
+murthy run \
   --model claude-sonnet-4-6 \
   --provider anthropic \
   --tasks sample \
@@ -95,21 +104,10 @@ python cli.py run \
   --think
 ```
 
-### One-shot baseline
-
-```bash
-python cli.py run \
-  --model claude-sonnet-4-6 \
-  --provider anthropic \
-  --tasks longebench \
-  --mode one-shot \
-  --limit 100
-```
-
 ### Against the L-LLM endpoint
 
 ```bash
-python cli.py run \
+murthy run \
   --model longevity-llm \
   --provider endpoint \
   --endpoint https://saujlffcxf20v74m.us-east-2.aws.endpoints.huggingface.cloud \
@@ -130,7 +128,7 @@ score = (10 + Σ floor(max/min) for GOOD final answers) × 2^(N − # good final
 - Only the **last** submission per problem counts
 - Refining a GOOD interval is a voluntary bet — if the new interval misses, you lose that problem
 - Feedback is **binary only**: GOOD or BAD — no "too high / too low"
-- Default budget: `floor(1.38 × N)` slips across all N problems
+- Default budget: `floor(18/13 × N)` slips across all N problems (matching real Estimathon's 18-slip / 13-problem ratio)
 - **Lower score is better**
 
 **Refinement accuracy** — the key signal: of all voluntary bets on GOOD intervals, what fraction
@@ -140,7 +138,7 @@ paid off? Random guessing wins ~50%. Significantly above 50% means genuine biolo
 
 | Track | Task formats | Scoring |
 |---|---|---|
-| Estimathon | regression, pairwise | Interval score + refinement accuracy |
+| Estimathon | regression | Interval score + refinement accuracy |
 | One-shot | binary, multiclass, ternary | Exact-match accuracy |
 | One-shot | generation (gene lists) | Token F1 ≥ 0.5 = correct |
 
@@ -190,12 +188,11 @@ Results written to `results.jsonl`. Fields include:
 ```
 longivity_hack/
 ├── cli.py                  Typer entry point
-├── requirements.txt
 ├── idea.md                 Benchmark design document
 ├── devlog.md               Development log
-├── CLAUDE.md               Developer guide for teammates
+├── CLAUDE.md               Developer guide for contributors
 └── benchmark/
-    ├── chat.py             Interactive chat UI (Claude tool-use, /setup wizard, slash autocomplete)
+    ├── chat.py             Interactive chat UI (first-run wizard, slash commands)
     ├── runner.py           Estimathon session, one-shot eval, run_mixed()
     ├── loader.py           Task loading — sample / LongeBench / local JSONL
     ├── client.py           Unified model client (all providers)

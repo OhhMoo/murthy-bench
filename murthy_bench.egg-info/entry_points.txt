@@ -1,3 +1,0 @@
-[console_scripts]
-murthy = longivity_hack.cli:entry
-murthy-bench = longivity_hack.cli:entry
