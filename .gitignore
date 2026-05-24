@@ -9,7 +9,7 @@ build/
 .env
 .env.local
 
-# LaTeX / document build artifacts
+# LaTeX build artifacts (intermediates only — not .tex or .pdf sources)
 *.aux
 *.log
 *.out
@@ -17,8 +17,6 @@ build/
 *.fls
 *.fdb_latexmk
 *.synctex.gz
-*.pdf
-*.tex
 
 # Misc run artifacts
 benchmark_summary_*.csv
