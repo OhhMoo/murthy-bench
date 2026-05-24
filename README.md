@@ -7,11 +7,9 @@ Non-numerical tasks (binary, multiclass, ternary, generation) are scored with st
 
 ---
 
-## Screenshots
+## Usage Example
 
 ![Interactive chat](docs/pictures/convo.jpg)
-
-![HuggingFace model browser](docs/pictures/HF.jpg)
 
 ![CLI benchmark run](docs/pictures/CLI.jpg)
 
