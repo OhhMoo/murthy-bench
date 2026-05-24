@@ -25,12 +25,13 @@ from rich.table import Table
 from rich.text import Text
 
 from . import config as cfg
+from . import client as client_module
 from .client import ModelClient
 from .loader import load_tasks
 from .model_manager import ModelManager
 from .results import ResultWriter
 from .runner import (
-    run_estimathon, run_eval, run_mixed,
+    run_estimathon, run_estimathon_isolated, run_eval, run_mixed,
     _fmt_score, _MAX_ESTIMATHON_PROBLEMS, _ESTIMATHON_FORMATS,
 )
 
@@ -93,6 +94,7 @@ _SLASH_META = [
     ("/provider",     "Show or set provider  (anthropic|openai|hf|endpoint)"),
     ("/tasks",        "Show or set default task source"),
     ("/think",        "Toggle chain-of-thought traces"),
+    ("/cheat",        "Toggle cheat mode — print every API request and raw response"),
     ("/explore",      "Show all unique task types in LongeBench (regression only)"),
     ("/question_set", "Preview tasks from a source"),
     ("/benchmark",    "Quick-run estimathon with current defaults"),
@@ -131,6 +133,7 @@ class ChatState:
     bench_model:      str  = "claude-haiku-4-5-20251001"
     bench_provider:   str  = "anthropic"
     think_mode:       bool = False
+    cheat_mode:       bool = False
     default_tasks:    str  = "sample"
     conversation:     list = field(default_factory=list)
 
@@ -213,7 +216,110 @@ _TOOLS = [
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+def _print_multi_attempt_table(slip_records: list[dict]) -> None:
+    """Show per-problem revision history for problems answered more than once.
+
+    Highlights how the model evolved (or didn't) across attempts — useful for
+    spotting models that just resubmit the same interval vs ones that adapt.
+    """
+    by_pid: dict[str, list[dict]] = {}
+    for r in slip_records:
+        by_pid.setdefault(r["pid"], []).append(r)
+
+    repeats = {pid: rs for pid, rs in by_pid.items() if len(rs) > 1}
+    if not repeats:
+        return
+
+    table = Table(
+        title="[bold rgb(195,225,100)]Multi-attempt summary[/bold rgb(195,225,100)]  "
+              "[dim](only problems answered more than once)[/dim]",
+        border_style="rgb(100,145,55)",
+        show_lines=False,
+        padding=(0, 1),
+    )
+    table.add_column("Problem",     style="cyan",   no_wrap=True)
+    table.add_column("Gold",        style="dim",    justify="right", no_wrap=True)
+    table.add_column("#",           style="dim",    justify="right", no_wrap=True)
+    table.add_column("Attempts  [dim](=  same as prev,  ≠  changed)[/dim]")
+    table.add_column("Final",       no_wrap=True)
+
+    for pid in sorted(repeats.keys(), key=lambda p: (-len(repeats[p]), p)):
+        records = repeats[pid]
+        gold = records[0].get("gold")
+        gold_str = f"{gold:g}" if isinstance(gold, (int, float)) else "—"
+
+        # Build the attempt sequence with change markers
+        parts = []
+        prev = None
+        for r in records:
+            pmin, pmax = r.get("pred_min"), r.get("pred_max")
+            good = r.get("good", False)
+            colour = "green" if good else "red"
+            tag    = "GOOD" if good else "BAD "
+            interval = f"[{pmin:g}, {pmax:g}]" if pmin is not None and pmax is not None else "—"
+
+            if prev is None:
+                marker = " "
+            elif prev == (pmin, pmax):
+                marker = "[yellow]=[/yellow]"   # same interval as previous attempt
+            else:
+                marker = "[dim]≠[/dim]"
+            parts.append(f"{marker} [{colour}]{tag}[/{colour}] {interval}")
+            prev = (pmin, pmax)
+
+        # Count how many times the model resubmitted the exact same interval
+        same_count = sum(
+            1 for i in range(1, len(records))
+            if (records[i-1].get("pred_min"), records[i-1].get("pred_max"))
+            == (records[i].get("pred_min"),   records[i].get("pred_max"))
+        )
+        last = records[-1]
+        final_good = last.get("good", False)
+        final_str = (
+            f"[green]GOOD[/green] w={last.get('width_factor')}"
+            if final_good else "[red]BAD[/red]"
+        )
+        if same_count:
+            final_str += f"  [yellow]({same_count}× repeat)[/yellow]"
+
+        table.add_row(pid, gold_str, str(len(records)), "  ".join(parts), final_str)
+
+    console.print()
+    console.print(table)
+
+
+def _is_longevity_llm(model: str) -> bool:
+    """The Insilico L-LLM lives on a HF endpoint — its bare name is never a valid
+    provider-side model id, so we recognise it by config or the literal alias."""
+    return model == "longevity-llm" or model == cfg.get("llm.model")
+
+
+def _route_longevity_llm(
+    model: str, provider: str, api_key: str | None, endpoint_url: str | None
+) -> tuple[str, str | None, str | None] | str:
+    """If `model` is the L-LLM alias and the caller didn't already specify an
+    endpoint, swap provider→endpoint and fill endpoint_url/api_key from config.
+    Returns adjusted (provider, api_key, endpoint_url) or an error string."""
+    if not _is_longevity_llm(model):
+        return provider, api_key, endpoint_url
+    if endpoint_url or provider == "endpoint":
+        return provider, api_key, endpoint_url  # caller already routed it
+    cfg_endpoint = cfg.get("llm.endpoint")
+    cfg_key      = cfg.get("hf.token")
+    if not cfg_endpoint or not cfg_key:
+        return (
+            "longevity-llm requires llm.endpoint and hf.token in config "
+            "(run /setup or `murthy config set llm.endpoint <url>`)."
+        )
+    return "endpoint", (api_key or cfg_key), cfg_endpoint
+
+
 def _resolve_client(model: str, provider: str, api_key: str | None, endpoint_url: str | None) -> ModelClient | str:
+    routed = _route_longevity_llm(model, provider, api_key, endpoint_url)
+    if isinstance(routed, str):
+        return f"Credential error: {routed}"
+    provider, api_key, endpoint_url = routed
+
     key = api_key or cfg.provider_api_key(provider) or "none"
     if provider != "endpoint" and not api_key:
         err = cfg.provider_preflight(provider, api_key)
@@ -335,6 +441,17 @@ def _tool_run_benchmark(
     limit: int | None = None, think: bool = False, output: str = "results.jsonl",
     diverse: bool = False,
 ) -> str:
+    # Apply L-LLM auto-routing UP FRONT so every downstream decision
+    # (isolated-mode dispatch, panel display, client construction) sees the
+    # effective provider. Without this, `/test longevity-llm` keeps
+    # provider="anthropic" through the isolated-mode check, falls through
+    # to the legacy multi-turn runner, and blasts ~12k tokens at the
+    # endpoint per slip.
+    routed = _route_longevity_llm(model, provider, api_key, endpoint_url)
+    if isinstance(routed, str):
+        return f"Credential error: {routed}"
+    provider, api_key, endpoint_url = routed
+
     client = _resolve_client(model, provider, api_key, endpoint_url)
     if isinstance(client, str):
         return client
@@ -350,10 +467,17 @@ def _tool_run_benchmark(
     if not task_list:
         return "No tasks loaded."
 
+    # Every model — endpoint OR Anthropic/OpenAI/HF — runs in isolated
+    # per-problem context mode. Cross-problem scheduling is a confound
+    # for a biology benchmark (it tests strategy, not domain knowledge),
+    # so we force apples-to-apples: one problem per API call, no shared
+    # conversation, identical prompt shape across all providers.
+    use_isolated = mode in ("estimathon", "mixed")
+
     console.print(Panel(
         f"[green]Model:[/green] [cyan]{model}[/cyan]   "
         f"[green]Provider:[/green] {provider}   "
-        f"[green]Mode:[/green] {mode}   "
+        f"[green]Mode:[/green] {mode}{' [dim yellow](isolated)[/dim yellow]' if use_isolated else ''}   "
         f"[green]Tasks:[/green] {len(task_list)}   "
         f"[green]Think:[/green] {think}",
         border_style="rgb(100,145,55)", expand=False,
@@ -382,8 +506,10 @@ def _tool_run_benchmark(
     _slip_bar = _progress.add_task("slips  ", total=_eff_budget)
     _prob_bar = _progress.add_task("solved ", total=_n_est)
     _solved_pids: set = set()
+    _slip_records: list[dict] = []
 
     def _slip_line(r: dict) -> None:
+        _slip_records.append(r)
         good = r.get("good", False)
         wf   = r.get("width_factor")
         bar  = "█" * min(wf or 0, 20) if good else "░" * 10
@@ -402,6 +528,9 @@ def _tool_run_benchmark(
             _solved_pids.discard(pid)
         _progress.update(_prob_bar, completed=len(_solved_pids))
 
+        point_tag = ""
+        if r.get("parse_source") == "point":
+            point_tag = "  [yellow](point→interval)[/yellow]"
         _progress.console.print(
             f"  [dim]#{r['slip']:02d}[/dim]  "
             f"[cyan]{r['pid']:<5}[/cyan] [dim]{display_id:<14}[/dim]  "
@@ -410,6 +539,7 @@ def _tool_run_benchmark(
             + f"  [dim]{_fmt_score(r['score_before'])} → {_fmt_score(r['score_after'])}[/dim]"
             + (" [yellow]⚠ lost good[/yellow]" if r.get("prev_was_good") and not good else "")
             + attempt_tag
+            + point_tag
         )
         # Debug: show the question text and raw model response
         question = r.get("task_content", "")
@@ -436,6 +566,7 @@ def _tool_run_benchmark(
                 tasks=task_list, client=client,
                 total_budget=budget, enable_thinking=think,
                 on_slip=_slip_line, on_result=_result_line,
+                isolated=use_isolated,
             )
             writer.write(result)
             parts = []
@@ -453,8 +584,14 @@ def _tool_run_benchmark(
             summary = "  |  ".join(parts) if parts else "no results"
 
         elif mode == "estimathon":
-            result = run_estimathon(tasks=task_list, client=client,
-                                    total_budget=budget, enable_thinking=think, on_slip=_slip_line)
+            # use_isolated is always True for this mode (set above) — every
+            # provider runs in isolated per-problem context for apples-to-
+            # apples comparison. Legacy run_estimathon kept in runner.py
+            # for archaeology but no longer called from any path.
+            result = run_estimathon_isolated(
+                tasks=task_list, client=client,
+                total_budget=budget, enable_thinking=think, on_slip=_slip_line,
+            )
             writer.write(result)
             ref_acc = result.get("refinement_accuracy")
             ref_str = f"{ref_acc:.0%}" if ref_acc is not None else "n/a"
@@ -477,6 +614,8 @@ def _tool_run_benchmark(
 
     console.print(Rule(style="rgb(100,145,55)"))
     console.print(f"  [bold rgb(160,200,80)]Done.[/bold rgb(160,200,80)]  {summary}  [dim]→ {output}[/dim]")
+
+    _print_multi_attempt_table(_slip_records)
     return summary
 
 
@@ -618,6 +757,7 @@ def _help_panel() -> None:
         ("/provider",     "[provider]",              "Show or set default provider  (anthropic|openai|hf|endpoint)"),
         ("/tasks",        "[source]",                "Show or set default task source  (sample|longebench|<path>)"),
         ("/think",        "",                        "Toggle chain-of-thought traces for benchmark runs"),
+        ("/cheat",        "",                        "Toggle cheat mode — print every API request + raw response"),
         ("/explore",      "",                        "Show all unique task types in LongeBench (scans first 3000 rows)"),
         ("/question_set", "[source] [limit]",        "Preview tasks from a source"),
         ("/benchmark",    "[model] [provider] [tasks]","Quick-run estimathon with current defaults"),
@@ -643,33 +783,16 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
 
     if cmd == "/test":
         model = _resolve_model(args[0]) if args else state.bench_model
-
-        # Auto-route the configured L-LLM model name to its endpoint, so
-        # `/test longevity-llm` doesn't get sent to Anthropic (→ 404).
-        provider     = state.bench_provider
-        endpoint_url = None
-        api_key      = None
-        if model == cfg.get("llm.model") or model == "longevity-llm":
-            endpoint_url = cfg.get("llm.endpoint")
-            api_key      = cfg.get("hf.token")
-            if not endpoint_url or not api_key:
-                console.print(
-                    "[red]●[/red] longevity-llm needs [cyan]llm.endpoint[/cyan] and "
-                    "[cyan]hf.token[/cyan] in config. Run [bold]/setup[/bold] or "
-                    "[bold]/config[/bold]."
-                )
-                return True
-            provider = "endpoint"
-
+        # provider auto-routing for longevity-llm happens inside _resolve_client;
+        # show the effective provider here so the status line isn't misleading.
+        effective_provider = "endpoint" if _is_longevity_llm(model) else state.bench_provider
         console.print(
             f"[dim]Estimathon trial — 20 longebench tasks, 40-slip budget  "
-            f"·  model=[cyan]{model}[/cyan]  ·  provider=[cyan]{provider}[/cyan]…[/dim]"
+            f"·  model=[cyan]{model}[/cyan]  ·  provider=[cyan]{effective_provider}[/cyan]…[/dim]"
         )
         _tool_run_benchmark(
             model=model,
-            provider=provider,
-            api_key=api_key,
-            endpoint_url=endpoint_url,
+            provider=state.bench_provider,
             tasks_source="longebench",
             mode="estimathon",
             budget=40,
@@ -691,6 +814,18 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
     if cmd == "/think":
         state.think_mode = not state.think_mode
         console.print(f"[green]●[/green] Think mode [bold]{'ON' if state.think_mode else 'OFF'}[/bold]")
+        return True
+
+    if cmd == "/cheat":
+        state.cheat_mode = not state.cheat_mode
+        client_module.set_cheat(state.cheat_mode)
+        if state.cheat_mode:
+            console.print(
+                "[red]●[/red] Cheat mode [bold red]ON[/bold red]  "
+                "[dim]— every API request + raw response will be printed[/dim]"
+            )
+        else:
+            console.print("[green]●[/green] Cheat mode [bold]OFF[/bold]")
         return True
 
     if cmd == "/model":
@@ -729,6 +864,12 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
         else:
             state.bench_model = _resolve_model(subcmd)
             console.print(f"[green]●[/green] Model → [cyan]{state.bench_model}[/cyan]")
+
+        # Pin provider→endpoint when the selected model is the L-LLM, so
+        # subsequent /benchmark, /status, and the status line stay coherent.
+        if _is_longevity_llm(state.bench_model) and state.bench_provider != "endpoint":
+            state.bench_provider = "endpoint"
+            console.print("[green]●[/green] Provider → [cyan]endpoint[/cyan]  [dim](auto, L-LLM lives on HF endpoint)[/dim]")
         return True
 
     if cmd == "/provider":
@@ -861,12 +1002,34 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
         return True
 
     if cmd == "/config":
-        if len(args) >= 2:
-            cfg.set_value(args[0], args[1])
-            console.print(f"[green]●[/green] {args[0]} = [cyan]{args[1]!r}[/cyan]")
-        elif len(args) == 1:
-            val = cfg.get(args[0])
-            console.print(f"  {args[0]} = [cyan]{val!r}[/cyan]")
+        # Accept both grammars:
+        #   /config <key> <value>       (legacy slash form)
+        #   /config set <key> <value>   (matches `murthy config set …` CLI)
+        #   /config get <key>           (matches the CLI for symmetry)
+        sub_args = args
+        if sub_args and sub_args[0].lower() in ("set", "get", "unset"):
+            verb = sub_args[0].lower()
+            sub_args = sub_args[1:]
+            if verb == "set" and len(sub_args) < 2:
+                console.print("[yellow]Usage: /config set <key> <value>[/yellow]")
+                return True
+            if verb in ("get", "unset") and len(sub_args) < 1:
+                console.print(f"[yellow]Usage: /config {verb} <key>[/yellow]")
+                return True
+            if verb == "unset":
+                cfg.set_value(sub_args[0], None)
+                console.print(f"[green]●[/green] {sub_args[0]} = [dim]unset[/dim]")
+                return True
+
+        if len(sub_args) >= 2:
+            # Join remaining tokens so unquoted URLs still work
+            # ("/config set llm.endpoint https://… extra" would otherwise drop tokens).
+            key, value = sub_args[0], " ".join(sub_args[1:])
+            cfg.set_value(key, value)
+            console.print(f"[green]●[/green] {key} = [cyan]{value!r}[/cyan]")
+        elif len(sub_args) == 1:
+            val = cfg.get(sub_args[0])
+            console.print(f"  {sub_args[0]} = [cyan]{val!r}[/cyan]")
         else:
             for k, v in sorted(cfg.all_values().items()):
                 display = str(v) if v is not None else "[dim]not set[/dim]"
@@ -982,14 +1145,30 @@ def run_chat(chat_model: str = "claude-sonnet-4-6", api_key: str | None = None) 
 
         # Agentic tool-use loop
         while True:
-            with _thinking("Thinking"):
-                response = anthropic_client.messages.create(
-                    model=state.chat_model,
-                    max_tokens=4096,
-                    system=_SYSTEM,
-                    tools=_TOOLS,
-                    messages=state.conversation,
+            chat_kwargs = dict(
+                model=state.chat_model,
+                max_tokens=4096,
+                system=_SYSTEM,
+                tools=_TOOLS,
+                messages=state.conversation,
+            )
+            if state.cheat_mode:
+                client_module._cheat_dump(
+                    f"REQUEST  chat-orchestrator → {state.chat_model}", chat_kwargs
                 )
+            with _thinking("Thinking"):
+                response = anthropic_client.messages.create(**chat_kwargs)
+            if state.cheat_mode:
+                try:
+                    client_module._cheat_dump(
+                        f"RAW RESPONSE  chat-orchestrator ← {state.chat_model}",
+                        response.model_dump(),
+                    )
+                except Exception as exc:
+                    client_module._cheat_dump(
+                        f"RAW RESPONSE  chat-orchestrator ← {state.chat_model}",
+                        {"dump_error": str(exc), "stop_reason": getattr(response, "stop_reason", None)},
+                    )
 
             if response.stop_reason == "end_turn":
                 text = "".join(b.text for b in response.content if hasattr(b, "text"))

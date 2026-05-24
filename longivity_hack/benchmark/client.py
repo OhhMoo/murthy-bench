@@ -1,8 +1,89 @@
+import json
 import re
 import time
 from dataclasses import dataclass
 
 _HF_BASE = "https://api-inference.huggingface.co/models/{model_id}/v1"
+
+# ---------------------------------------------------------------------------
+# Cheat mode — when ON, every API request/response is printed verbatim.
+# Toggled from chat.py via /cheat. Module-level so ModelClient instances
+# (which don't see ChatState) still pick it up.
+# ---------------------------------------------------------------------------
+
+_CHEAT_ENABLED = False
+
+
+def set_cheat(enabled: bool) -> None:
+    global _CHEAT_ENABLED
+    _CHEAT_ENABLED = bool(enabled)
+
+
+def is_cheat() -> bool:
+    return _CHEAT_ENABLED
+
+
+def cheat_header(text: str) -> None:
+    """Print a one-line scheduling header (e.g. 'Slip 5/40 → P3 attempt 2/3').
+    Visible only when cheat mode is on; otherwise silent."""
+    if not _CHEAT_ENABLED:
+        return
+    try:
+        from rich.console import Console
+        Console().print(f"[bold bright_white on rgb(45,80,25)] {text} [/]")
+    except Exception:
+        print(f"\n── {text} ──")
+
+
+def _cheat_dump(label: str, payload, kind: str = "info") -> None:
+    """Print a labelled, syntax-highlighted JSON dump.
+
+    kind ∈ {"request", "response", "info"} colour-codes the border and title
+    so requests (outbound) and responses (inbound) are easy to scan.
+    """
+    if not _CHEAT_ENABLED:
+        return
+
+    # Auto-detect kind from the label if caller didn't set it.
+    if kind == "info":
+        upper = label.upper()
+        if "REQUEST" in upper or "→" in label:
+            kind = "request"
+        elif "RESPONSE" in upper or "←" in label:
+            kind = "response"
+
+    palette = {
+        "request":  ("bold yellow",      "yellow",       "▶"),
+        "response": ("bold bright_cyan", "bright_cyan",  "◀"),
+        "info":     ("bold magenta",     "magenta",      "●"),
+    }
+    title_style, border, glyph = palette.get(kind, palette["info"])
+
+    try:
+        body = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    except Exception:
+        body = repr(payload)
+
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.syntax import Syntax
+        syntax = Syntax(
+            body,
+            "json",
+            theme="monokai",
+            line_numbers=False,
+            word_wrap=True,
+            background_color="default",
+        )
+        Console().print(Panel(
+            syntax,
+            title=f"[{title_style}]{glyph}  CHEAT  {label}[/{title_style}]",
+            border_style=border,
+            expand=False,
+        ))
+    except Exception:
+        print(f"\n=== CHEAT {label} ===\n{body}\n=== /CHEAT ===\n")
 
 
 @dataclass
@@ -93,8 +174,14 @@ class ModelClient:
         if enable_thinking:
             kwargs["max_tokens"] = max(max_tokens, 3000)
 
+        _cheat_dump(f"REQUEST  {self.provider} → {self.model_id}", kwargs)
         resp = client.chat.completions.create(**kwargs)
         raw = resp.choices[0].message.content or ""
+        if _CHEAT_ENABLED:
+            try:
+                _cheat_dump(f"RAW RESPONSE  {self.provider} ← {self.model_id}", resp.model_dump())
+            except Exception:
+                _cheat_dump(f"RAW RESPONSE  {self.provider} ← {self.model_id}", {"content": raw})
         think, answer = _split_think(raw)
         tokens = resp.usage.total_tokens if resp.usage else 0
         return ChatResponse(answer=answer, think=think, tokens_used=tokens)
@@ -122,8 +209,14 @@ class ModelClient:
         if system_text:
             kwargs["system"] = system_text
 
+        _cheat_dump(f"REQUEST  anthropic → {self.model_id}", kwargs)
         resp = client.messages.create(**kwargs)
         raw = resp.content[0].text if resp.content else ""
+        if _CHEAT_ENABLED:
+            try:
+                _cheat_dump(f"RAW RESPONSE  anthropic ← {self.model_id}", resp.model_dump())
+            except Exception:
+                _cheat_dump(f"RAW RESPONSE  anthropic ← {self.model_id}", {"content": raw})
         think, answer = _split_think(raw)
         tokens = (resp.usage.input_tokens or 0) + (resp.usage.output_tokens or 0)
         return ChatResponse(answer=answer, think=think, tokens_used=tokens)

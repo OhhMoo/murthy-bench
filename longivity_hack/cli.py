@@ -29,7 +29,7 @@ try:
     from .benchmark.client import ModelClient
     from .benchmark.loader import load_tasks
     from .benchmark.results import ResultWriter
-    from .benchmark.runner import run_eval, run_estimathon, run_mixed, _fmt_score, _ESTIMATHON_FORMATS
+    from .benchmark.runner import run_eval, run_estimathon, run_estimathon_isolated, run_mixed, _fmt_score, _ESTIMATHON_FORMATS
 except ImportError:
     # local dev: python cli.py from inside longivity_hack/
     from benchmark import config as cfg
@@ -37,7 +37,7 @@ except ImportError:
     from benchmark.client import ModelClient
     from benchmark.loader import load_tasks
     from benchmark.results import ResultWriter
-    from benchmark.runner import run_eval, run_estimathon, run_mixed, _fmt_score, _ESTIMATHON_FORMATS
+    from benchmark.runner import run_eval, run_estimathon, run_estimathon_isolated, run_mixed, _fmt_score, _ESTIMATHON_FORMATS
 
 app = typer.Typer(
     name="longevity",
@@ -154,7 +154,8 @@ def run(
     with ResultWriter(str(output)) as writer:
 
         # ------------------------------------------------------------------
-        # Estimathon mode — single multi-turn session, shared budget
+        # Estimathon mode — one problem per fresh API call (isolated context)
+        # for apples-to-apples comparison across all providers.
         # ------------------------------------------------------------------
         if mode == EvalMode.estimathon:
             slip_count = 0
@@ -182,12 +183,11 @@ def run(
                 if raw:
                     console.print(f"     [dim]→[/dim] [dim]{raw[:200]}[/dim]")
 
-            session_result = run_estimathon(
+            session_result = run_estimathon_isolated(
                 tasks=task_list,
                 client=client,
                 total_budget=budget,
                 enable_thinking=think,
-                extractor=extractor_client,
                 on_slip=on_slip,
             )
             writer.write(session_result)
