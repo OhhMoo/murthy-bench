@@ -575,14 +575,14 @@ def run_estimathon_isolated(
             continue
 
         # Hard server-side exact-repeat rejection. Burns a per-problem
-        # attempt slot so the problem locks faster, but does NOT burn
-        # a slip — the model gets a chance to actually change its answer.
+        # attempt slot so the problem locks after 3 total attempts (real
+        # or rejected), but does NOT burn a slip and does NOT bump the
+        # global parse_failures counter. Round-robin will eventually find
+        # every problem locked and the "all locked" check exits cleanly,
+        # so we don't need a global repeat bail — per-problem locking
+        # already prevents infinite loops.
         if session.last_submissions.get(pid) == (pmin, pmax):
             session.per_problem_slips[pid] = session.per_problem_slips.get(pid, 0) + 1
-            parse_failures += 1
-            if parse_failures >= 3:
-                print(f"\n[Estimathon-iso] 3 consecutive exact-repeat submissions. Returning partial results.")
-                break
             cursor = (cursor + 1) % n  # advance to a different problem
             continue
         parse_failures = 0
@@ -739,13 +739,7 @@ def run_estimathon(
         if already_tried:
             session.per_problem_slips[pid] = session.per_problem_slips.get(pid, 0) + 1
             attempts_after = session.per_problem_slips[pid]
-            parse_failures += 1
-            if parse_failures >= 3:
-                print(
-                    f"\n[Estimathon] 3 consecutive exact-repeat submissions. "
-                    f"Returning partial results."
-                )
-                break
+            # Per-problem locking handles termination — no global bail needed.
             if attempts_after >= _MAX_SLIPS_PER_PROBLEM:
                 conversation.append({"role": "assistant", "content": resp.answer})
                 conversation.append({
