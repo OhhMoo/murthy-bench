@@ -1,8 +1,14 @@
 import json
 import os
+import random
 import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Iterator
+
+# How many rows to scan when building a diverse task sample.
+# LongeBench repeats task types in long runs, so 3000 rows is enough to hit all types.
+_DIVERSE_SCAN_CAP = 3000
 
 # ---------------------------------------------------------------------------
 # Built-in sample tasks (no HuggingFace required)
@@ -276,6 +282,7 @@ def load_tasks(
     limit: int | None = None,
     estimathon: bool = False,
     mixed: bool = False,
+    diverse: bool = False,
 ) -> list[dict]:
     """
     Load task dicts from:
@@ -286,11 +293,14 @@ def load_tasks(
 
     estimathon=True  — numerical tasks only, prompts rewritten to request [min, max]
     mixed=True       — all tasks; numerical ones are rewritten, categorical kept as-is
+    diverse=True     — sample evenly across all lb_id task types (scans up to _DIVERSE_SCAN_CAP rows)
     (both False)     — all tasks, no transformation
     """
     if source == "sample":
         return _load_sample(limit)
     elif source.startswith("longebench"):
+        if diverse and limit is not None:
+            return _load_longebench_diverse(source, limit, estimathon=estimathon, mixed=mixed)
         return _load_longebench(source, limit, estimathon=estimathon, mixed=mixed)
     else:
         return _load_jsonl(source, limit)
@@ -339,6 +349,71 @@ def _load_longebench(
         count += 1
 
     return tasks
+
+
+def _load_longebench_diverse(
+    source: str, limit: int, estimathon: bool, mixed: bool
+) -> list[dict]:
+    """Sample tasks evenly across every unique lb_id task type found in LongeBench.
+
+    Scans the first _DIVERSE_SCAN_CAP rows, groups eligible tasks by lb_id, then
+    distributes `limit` slots as evenly as possible across all types.
+    This prevents all tasks from being the same question type (e.g. age estimation).
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError("Run: pip install datasets")
+
+    from . import config as cfg
+    token = cfg.get("hf.token") or os.environ.get("HF_TOKEN")
+    config_name = "extra" if source == "longebench:extra" else "benchmark"
+    ds = load_dataset("insilicomedicine/longebench", config_name, split="eval", token=token)
+
+    # First pass: collect up to _DIVERSE_SCAN_CAP eligible tasks, grouped by lb_id
+    pool: dict[str, list] = defaultdict(list)
+    scanned = 0
+    for row in ds:
+        if scanned >= _DIVERSE_SCAN_CAP:
+            break
+        scanned += 1
+        task = dict(row)
+
+        if estimathon:
+            task = _transform_lb_to_estimathon(task)
+            if task is None:
+                continue
+        elif mixed:
+            transformed = _transform_lb_to_estimathon(task)
+            if transformed is not None:
+                task = transformed
+
+        lb_id = task.get("lb_id", "unknown")
+        pool[lb_id].append(task)
+
+    if not pool:
+        return []
+
+    types = sorted(pool.keys())
+    n_types = len(types)
+    per_type = max(1, limit // n_types)
+    remainder = limit - per_type * n_types  # extra slots for first N types
+
+    result: list[dict] = []
+    for i, lb_id in enumerate(types):
+        quota = per_type + (1 if i < remainder else 0)
+        bucket = pool[lb_id]
+        result.extend(random.sample(bucket, min(quota, len(bucket))))
+
+    # If we're still short (some buckets were smaller than quota), fill from leftovers
+    if len(result) < limit:
+        used = {id(t) for t in result}
+        leftovers = [t for bucket in pool.values() for t in bucket if id(t) not in used]
+        random.shuffle(leftovers)
+        result.extend(leftovers[: limit - len(result)])
+
+    random.shuffle(result)
+    return result[:limit]
 
 
 def _load_jsonl(path: str, limit: int | None) -> list[dict]:

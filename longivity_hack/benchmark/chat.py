@@ -93,6 +93,7 @@ _SLASH_META = [
     ("/provider",     "Show or set provider  (anthropic|openai|hf|endpoint)"),
     ("/tasks",        "Show or set default task source"),
     ("/think",        "Toggle chain-of-thought traces"),
+    ("/explore",      "Show all unique task types in LongeBench (regression only)"),
     ("/question_set", "Preview tasks from a source"),
     ("/benchmark",    "Quick-run estimathon with current defaults"),
     ("/status",       "Check model connectivity"),
@@ -221,6 +222,77 @@ def _resolve_client(model: str, provider: str, api_key: str | None, endpoint_url
     return ModelClient(provider=provider, model_id=model, api_key=key, endpoint_url=endpoint_url)
 
 
+def _tool_explore_task_types() -> None:
+    """Scan LongeBench and print a table of all unique regression task types."""
+    from collections import defaultdict
+    from .loader import _DIVERSE_SCAN_CAP, _transform_lb_to_estimathon
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        console.print("[red]datasets not installed — run: pip install datasets[/red]")
+        return
+
+    from . import config as cfg
+    import os
+    token = cfg.get("hf.token") or os.environ.get("HF_TOKEN")
+    if not token:
+        console.print("[red]HF token not set — run /setup first[/red]")
+        return
+
+    console.print(f"[dim]Scanning first {_DIVERSE_SCAN_CAP} LongeBench rows…[/dim]")
+    try:
+        ds = load_dataset("insilicomedicine/longebench", "benchmark", split="eval", token=token)
+    except Exception as exc:
+        console.print(f"[red]Load error:[/red] {exc}")
+        return
+
+    types: dict[str, dict] = {}   # lb_id → {task, domain, format, count, gold_example}
+    scanned = 0
+    for row in ds:
+        if scanned >= _DIVERSE_SCAN_CAP:
+            break
+        scanned += 1
+        lb_id = row.get("lb_id", "?")
+        fmt   = row.get("format", "?")
+        if lb_id not in types:
+            types[lb_id] = {
+                "task":   row.get("task", ""),
+                "domain": row.get("domain", ""),
+                "format": fmt,
+                "count":  0,
+                "gold":   (row.get("messages") or [{}])[-1].get("content", "")[:12],
+                "numeric": _transform_lb_to_estimathon(dict(row)) is not None,
+            }
+        types[lb_id]["count"] += 1
+
+    table = Table(
+        title=f"[green]LongeBench task types[/green]  (scanned {scanned} rows)",
+        border_style="green",
+    )
+    table.add_column("lb_id",   style="cyan", no_wrap=True)
+    table.add_column("format",  style="dim")
+    table.add_column("domain")
+    table.add_column("task name")
+    table.add_column("gold eg.", justify="right", style="dim")
+    table.add_column("Estimathon?", justify="center")
+    table.add_column("count", justify="right", style="dim")
+
+    for lb_id, info in sorted(types.items()):
+        est_tag = "[green]✓[/green]" if info["numeric"] else "[red]✗[/red]"
+        table.add_row(
+            lb_id, info["format"], info["domain"][:20],
+            info["task"][:35], info["gold"], est_tag, str(info["count"]),
+        )
+
+    console.print(table)
+    n_est = sum(1 for v in types.values() if v["numeric"])
+    console.print(
+        f"  [dim]{len(types)} unique task types · "
+        f"{n_est} Estimathon-compatible (regression/interval) · "
+        f"/test now samples evenly across all {n_est} numeric types[/dim]"
+    )
+
+
 def _tool_preview_tasks(source: str, limit: int = 7) -> str:
     try:
         task_list = load_tasks(source, limit=limit, estimathon=False)
@@ -261,6 +333,7 @@ def _tool_run_benchmark(
     api_key: str | None = None, endpoint_url: str | None = None,
     mode: str = "estimathon", budget: int | None = None,
     limit: int | None = None, think: bool = False, output: str = "results.jsonl",
+    diverse: bool = False,
 ) -> str:
     client = _resolve_client(model, provider, api_key, endpoint_url)
     if isinstance(client, str):
@@ -270,6 +343,7 @@ def _tool_run_benchmark(
             tasks_source, limit=limit,
             estimathon=(mode == "estimathon"),
             mixed=(mode == "mixed"),
+            diverse=diverse,
         )
     except Exception as exc:
         return f"Error loading tasks: {exc}"
@@ -544,6 +618,7 @@ def _help_panel() -> None:
         ("/provider",     "[provider]",              "Show or set default provider  (anthropic|openai|hf|endpoint)"),
         ("/tasks",        "[source]",                "Show or set default task source  (sample|longebench|<path>)"),
         ("/think",        "",                        "Toggle chain-of-thought traces for benchmark runs"),
+        ("/explore",      "",                        "Show all unique task types in LongeBench (scans first 3000 rows)"),
         ("/question_set", "[source] [limit]",        "Preview tasks from a source"),
         ("/benchmark",    "[model] [provider] [tasks]","Quick-run estimathon with current defaults"),
         ("/status",       "[model] [provider]",      "Check model connectivity"),
@@ -580,6 +655,7 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
             budget=40,
             limit=20,
             think=state.think_mode,
+            diverse=True,
         )
         return True
 
@@ -649,6 +725,10 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
             console.print(f"[green]●[/green] Default tasks → [cyan]{state.default_tasks}[/cyan]")
         else:
             console.print(f"  tasks: [cyan]{state.default_tasks}[/cyan]")
+        return True
+
+    if cmd == "/explore":
+        _tool_explore_task_types()
         return True
 
     if cmd == "/question_set":
