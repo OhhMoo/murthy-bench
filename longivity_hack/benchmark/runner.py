@@ -1031,7 +1031,7 @@ def run_mixed(
     extractor: "ModelClient | None" = None,
     on_slip: Callable[[dict], None] | None = None,
     on_result: Callable[[dict], None] | None = None,
-    isolated: bool = False,
+    isolated: bool = True,
 ) -> dict:
     """
     Split tasks by format:

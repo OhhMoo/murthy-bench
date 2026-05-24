@@ -467,23 +467,21 @@ def _tool_run_benchmark(
     if not task_list:
         return "No tasks loaded."
 
-    # Smaller models on a local/HF endpoint drown in the shared-budget
-    # conversation. Auto-switch to isolated per-problem context for them.
-    use_isolated = (provider == "endpoint") and mode in ("estimathon", "mixed")
+    # Every model — endpoint OR Anthropic/OpenAI/HF — runs in isolated
+    # per-problem context mode. Cross-problem scheduling is a confound
+    # for a biology benchmark (it tests strategy, not domain knowledge),
+    # so we force apples-to-apples: one problem per API call, no shared
+    # conversation, identical prompt shape across all providers.
+    use_isolated = mode in ("estimathon", "mixed")
 
     console.print(Panel(
         f"[green]Model:[/green] [cyan]{model}[/cyan]   "
         f"[green]Provider:[/green] {provider}   "
-        f"[green]Mode:[/green] {mode}{' [yellow](isolated context)[/yellow]' if use_isolated else ''}   "
+        f"[green]Mode:[/green] {mode}{' [dim yellow](isolated)[/dim yellow]' if use_isolated else ''}   "
         f"[green]Tasks:[/green] {len(task_list)}   "
         f"[green]Think:[/green] {think}",
         border_style="rgb(100,145,55)", expand=False,
     ))
-    if use_isolated:
-        console.print(
-            "  [dim yellow]→ endpoint provider: sending one problem per API call "
-            "(no shared conversation) to keep prompt small[/dim yellow]"
-        )
 
     # Pre-compute Estimathon totals so the progress bar has correct maxima.
     if mode == "mixed":
