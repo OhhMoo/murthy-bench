@@ -1,4 +1,4 @@
-# Murphy — Longevity Benchmark CLI
+# Murthy — Longevity Benchmark CLI
 
 Evaluate any LLM on aging-biology tasks using an **Estimathon-style** benchmark.
 Models submit intervals `[min, max]` for numerical questions, receive only **binary feedback**
