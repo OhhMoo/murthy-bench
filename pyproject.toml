@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "murthy-bench"
-version = "0.2.0"
+version = "0.2.1"
 description = "Longevity LLM benchmark CLI — Estimathon-style evaluation for aging-biology tasks"
 readme = "README.md"
 license = {text = "MIT"}
@@ -22,11 +22,8 @@ dependencies = [
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
     "requests>=2.31.0",
+    "datasets>=2.0.0",
 ]
-
-[project.optional-dependencies]
-longebench = ["datasets>=2.0.0"]
-all = ["datasets>=2.0.0"]
 
 [project.scripts]
 murthy       = "longivity_hack.cli:entry"

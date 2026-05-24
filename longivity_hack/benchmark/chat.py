@@ -59,7 +59,7 @@ _GRADIENT = [
     "rgb(195,225,100)",
 ]
 
-_VERSION = "v0.2.0"
+_VERSION = "v0.2.1"
 _TAGLINE = "Longevity LLM Benchmark  ·  Estimathon-style evaluation"
 
 # Model shorthands for /test and /model commands
@@ -900,10 +900,25 @@ def _thinking(label: str = "Thinking"):
 
 def run_chat(chat_model: str = "claude-sonnet-4-6", api_key: str | None = None) -> None:
     key = api_key or cfg.get("anthropic.api_key")
+
+    # First run: no Anthropic key → walk through setup before opening chat
+    if not key:
+        console.print(Panel(
+            "[bold]Welcome to Murphy![/bold]\n\n"
+            "It looks like this is your first time running Murphy.\n"
+            "Let's configure your API keys before we start.\n\n"
+            "[dim]You can always re-run this wizard with [green]/setup[/green][/dim]",
+            title="[rgb(195,225,100)]  First Run Setup  [/rgb(195,225,100)]",
+            border_style="rgb(100,145,55)",
+            expand=False,
+        ))
+        _setup_wizard()
+        key = api_key or cfg.get("anthropic.api_key")
+
     if not key:
         console.print(
-            "[red]No Anthropic API key found.[/red]\n"
-            "Run: [green]python cli.py config set anthropic.api_key <key>[/green]"
+            "[red]No Anthropic API key set.[/red]\n"
+            "Run: [green]murthy config set anthropic.api_key sk-ant-...[/green]"
         )
         return
 
