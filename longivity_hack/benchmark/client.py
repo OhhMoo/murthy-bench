@@ -23,19 +23,53 @@ def is_cheat() -> bool:
     return _CHEAT_ENABLED
 
 
-def _cheat_dump(label: str, payload) -> None:
-    """Print a labelled JSON dump using rich if available, plain otherwise."""
+def _cheat_dump(label: str, payload, kind: str = "info") -> None:
+    """Print a labelled, syntax-highlighted JSON dump.
+
+    kind ∈ {"request", "response", "info"} colour-codes the border and title
+    so requests (outbound) and responses (inbound) are easy to scan.
+    """
     if not _CHEAT_ENABLED:
         return
+
+    # Auto-detect kind from the label if caller didn't set it.
+    if kind == "info":
+        upper = label.upper()
+        if "REQUEST" in upper or "→" in label:
+            kind = "request"
+        elif "RESPONSE" in upper or "←" in label:
+            kind = "response"
+
+    palette = {
+        "request":  ("bold yellow",      "yellow",       "▶"),
+        "response": ("bold bright_cyan", "bright_cyan",  "◀"),
+        "info":     ("bold magenta",     "magenta",      "●"),
+    }
+    title_style, border, glyph = palette.get(kind, palette["info"])
+
     try:
         body = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
     except Exception:
         body = repr(payload)
+
     try:
         from rich.console import Console
         from rich.panel import Panel
-        Console().print(Panel(body, title=f"[bold red]CHEAT  {label}[/bold red]",
-                              border_style="red", expand=False))
+        from rich.syntax import Syntax
+        syntax = Syntax(
+            body,
+            "json",
+            theme="monokai",
+            line_numbers=False,
+            word_wrap=True,
+            background_color="default",
+        )
+        Console().print(Panel(
+            syntax,
+            title=f"[{title_style}]{glyph}  CHEAT  {label}[/{title_style}]",
+            border_style=border,
+            expand=False,
+        ))
     except Exception:
         print(f"\n=== CHEAT {label} ===\n{body}\n=== /CHEAT ===\n")
 
