@@ -213,7 +213,38 @@ _TOOLS = [
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+def _is_longevity_llm(model: str) -> bool:
+    """The Insilico L-LLM lives on a HF endpoint — its bare name is never a valid
+    provider-side model id, so we recognise it by config or the literal alias."""
+    return model == "longevity-llm" or model == cfg.get("llm.model")
+
+
+def _route_longevity_llm(
+    model: str, provider: str, api_key: str | None, endpoint_url: str | None
+) -> tuple[str, str | None, str | None] | str:
+    """If `model` is the L-LLM alias and the caller didn't already specify an
+    endpoint, swap provider→endpoint and fill endpoint_url/api_key from config.
+    Returns adjusted (provider, api_key, endpoint_url) or an error string."""
+    if not _is_longevity_llm(model):
+        return provider, api_key, endpoint_url
+    if endpoint_url or provider == "endpoint":
+        return provider, api_key, endpoint_url  # caller already routed it
+    cfg_endpoint = cfg.get("llm.endpoint")
+    cfg_key      = cfg.get("hf.token")
+    if not cfg_endpoint or not cfg_key:
+        return (
+            "longevity-llm requires llm.endpoint and hf.token in config "
+            "(run /setup or `murthy config set llm.endpoint <url>`)."
+        )
+    return "endpoint", (api_key or cfg_key), cfg_endpoint
+
+
 def _resolve_client(model: str, provider: str, api_key: str | None, endpoint_url: str | None) -> ModelClient | str:
+    routed = _route_longevity_llm(model, provider, api_key, endpoint_url)
+    if isinstance(routed, str):
+        return f"Credential error: {routed}"
+    provider, api_key, endpoint_url = routed
+
     key = api_key or cfg.provider_api_key(provider) or "none"
     if provider != "endpoint" and not api_key:
         err = cfg.provider_preflight(provider, api_key)
@@ -643,33 +674,16 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
 
     if cmd == "/test":
         model = _resolve_model(args[0]) if args else state.bench_model
-
-        # Auto-route the configured L-LLM model name to its endpoint, so
-        # `/test longevity-llm` doesn't get sent to Anthropic (→ 404).
-        provider     = state.bench_provider
-        endpoint_url = None
-        api_key      = None
-        if model == cfg.get("llm.model") or model == "longevity-llm":
-            endpoint_url = cfg.get("llm.endpoint")
-            api_key      = cfg.get("hf.token")
-            if not endpoint_url or not api_key:
-                console.print(
-                    "[red]●[/red] longevity-llm needs [cyan]llm.endpoint[/cyan] and "
-                    "[cyan]hf.token[/cyan] in config. Run [bold]/setup[/bold] or "
-                    "[bold]/config[/bold]."
-                )
-                return True
-            provider = "endpoint"
-
+        # provider auto-routing for longevity-llm happens inside _resolve_client;
+        # show the effective provider here so the status line isn't misleading.
+        effective_provider = "endpoint" if _is_longevity_llm(model) else state.bench_provider
         console.print(
             f"[dim]Estimathon trial — 20 longebench tasks, 40-slip budget  "
-            f"·  model=[cyan]{model}[/cyan]  ·  provider=[cyan]{provider}[/cyan]…[/dim]"
+            f"·  model=[cyan]{model}[/cyan]  ·  provider=[cyan]{effective_provider}[/cyan]…[/dim]"
         )
         _tool_run_benchmark(
             model=model,
-            provider=provider,
-            api_key=api_key,
-            endpoint_url=endpoint_url,
+            provider=state.bench_provider,
             tasks_source="longebench",
             mode="estimathon",
             budget=40,
@@ -729,6 +743,12 @@ def _handle_slash(cmd: str, args: list[str], state: ChatState) -> bool:
         else:
             state.bench_model = _resolve_model(subcmd)
             console.print(f"[green]●[/green] Model → [cyan]{state.bench_model}[/cyan]")
+
+        # Pin provider→endpoint when the selected model is the L-LLM, so
+        # subsequent /benchmark, /status, and the status line stay coherent.
+        if _is_longevity_llm(state.bench_model) and state.bench_provider != "endpoint":
+            state.bench_provider = "endpoint"
+            console.print("[green]●[/green] Provider → [cyan]endpoint[/cyan]  [dim](auto, L-LLM lives on HF endpoint)[/dim]")
         return True
 
     if cmd == "/provider":
