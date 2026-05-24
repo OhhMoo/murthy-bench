@@ -23,6 +23,18 @@ def is_cheat() -> bool:
     return _CHEAT_ENABLED
 
 
+def cheat_header(text: str) -> None:
+    """Print a one-line scheduling header (e.g. 'Slip 5/40 → P3 attempt 2/3').
+    Visible only when cheat mode is on; otherwise silent."""
+    if not _CHEAT_ENABLED:
+        return
+    try:
+        from rich.console import Console
+        Console().print(f"[bold bright_white on rgb(45,80,25)] {text} [/]")
+    except Exception:
+        print(f"\n── {text} ──")
+
+
 def _cheat_dump(label: str, payload, kind: str = "info") -> None:
     """Print a labelled, syntax-highlighted JSON dump.
 

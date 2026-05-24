@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Iterator
 
+from . import client as _client_mod
 from .client import ModelClient
 
 # Python 3.11+ added a 4300-digit limit on int→str conversion (CVE guard).
@@ -309,17 +310,30 @@ def _parse_estimathon_response(text: str) -> tuple[int | None, float | None, flo
 #   - slips remaining
 # Round-robin scheduler picks the next unlocked problem.
 
+# Tighter content cap for isolated mode — the model isn't using the bulk of
+# the CpG / gene list anyway (its outputs are clearly a learned prior), so we
+# keep just the demographic preamble + a handful of features.
+_ISOLATED_PROBLEM_CONTENT_LIMIT = 600
+
+
+def _isolated_problem_content(task: dict) -> str:
+    msgs = task.get("messages", [])
+    user_msgs = [m for m in msgs if m.get("role") == "user"]
+    content = user_msgs[0]["content"] if user_msgs else ""
+    if len(content) > _ISOLATED_PROBLEM_CONTENT_LIMIT:
+        content = content[:_ISOLATED_PROBLEM_CONTENT_LIMIT] + " […]"
+    return content
+
+
 def _build_isolated_system_prompt() -> str:
+    # Bare-minimum rules. Format example at the end so it's the last thing
+    # the model sees before generating.
     return (
-        "You are answering a scientific estimation problem with a numeric interval.\n\n"
-        "Rules:\n"
-        "- Submit ONE interval [min, max] containing the correct answer.\n"
-        "- Wider is safer when uncertain: a GOOD wide interval is FAR better than any BAD.\n"
-        "- min and max must be positive numbers with min < max.\n\n"
-        "OUTPUT FORMAT — MANDATORY:\n"
-        "Your entire response must be ONLY this single line. No explanation. No reasoning.\n\n"
-        "INTERVAL [min, max]\n\n"
-        "Example: INTERVAL [30, 90]"
+        "Submit ONE numeric interval that contains the correct answer.\n"
+        "Wider is safer when uncertain.\n"
+        "min and max must be positive with min < max.\n"
+        "Output ONLY this single line, nothing else:\n"
+        "INTERVAL [min, max]"
     )
 
 
@@ -327,26 +341,35 @@ def _build_isolated_user_message(
     task: dict, pid: str, problem_num: int,
     wrong_intervals: list[tuple[float, float]], slips_remaining: int,
 ) -> str:
-    domain = task.get("domain", "")
-    metric = task.get("metric", "")
-    content = _problem_content(task)
+    content = _isolated_problem_content(task)
 
-    wrong_block = ""
+    forbidden_block = ""
     if wrong_intervals:
-        wrong_lines = "\n".join(f"  [{a}, {b}]" for a, b in wrong_intervals)
-        wrong_block = (
-            "\n\nYour previous attempts on this problem were WRONG "
-            "(the answer is NOT in any of these intervals):\n"
+        # FORBIDDEN goes right before the answer slot so the model sees it
+        # last — models tend to weight end-of-prompt content more heavily.
+        wrong_lines = "\n".join(f"  ✗ [{a}, {b}] — WRONG" for a, b in wrong_intervals)
+        forbidden_block = (
+            "\n\n━━━ DO NOT REPEAT THESE — already tried, all WRONG ━━━\n"
             f"{wrong_lines}\n"
-            "Submit a DIFFERENT interval. Consider widening to be safe."
+            "The answer is NOT in any range above. Pick a DIFFERENT range."
         )
+        # Detect repeated identical submissions — model is stuck. Add a
+        # stronger nudge with a concrete alternative.
+        if len(wrong_intervals) >= 2 and wrong_intervals[-1] == wrong_intervals[-2]:
+            last_min, last_max = wrong_intervals[-1]
+            mid = (last_min + last_max) / 2
+            shift = max(abs(last_max - last_min) * 3, 20)
+            suggest_lo = max(1, mid - shift)
+            suggest_hi = mid + shift
+            forbidden_block += (
+                f"\nYou submitted the SAME interval twice. You MUST change it.\n"
+                f"Try a much wider range, e.g. INTERVAL [{suggest_lo:g}, {suggest_hi:g}]."
+            )
 
     return (
-        f"Problem {problem_num}  [{domain}  |  {metric}]\n\n"
         f"{content}"
-        f"{wrong_block}\n\n"
-        f"Slips remaining (across all problems): {slips_remaining}\n\n"
-        "Submit your interval:\nINTERVAL [min, max]"
+        f"{forbidden_block}\n\n"
+        "Your interval:\nINTERVAL [min, max]"
     )
 
 
@@ -419,6 +442,12 @@ def run_estimathon_isolated(
                 session.slips_remaining,
             )},
         ]
+
+        # In cheat mode, surface the scheduling order before the request dump.
+        _client_mod.cheat_header(
+            f"Slip {session.slips_used + 1}/{total_budget}  →  {pid} "
+            f"(attempt {session.per_problem_slips.get(pid, 0) + 1}/{_MAX_SLIPS_PER_PROBLEM})"
+        )
 
         try:
             resp = client.chat(
