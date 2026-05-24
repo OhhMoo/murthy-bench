@@ -59,6 +59,11 @@ def set_value(key: str, value) -> None:
     data = _load_file()
     data[key] = value
     _save_file(data)
+    # Sync to environment so subsequent get()/all_values() calls in this
+    # process see the new value instead of stale env-var overrides.
+    env_var = _ENV_OVERRIDES.get(key)
+    if env_var and value is not None:
+        os.environ[env_var] = str(value)
 
 
 def all_values() -> dict:
