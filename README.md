@@ -11,8 +11,6 @@ Non-numerical tasks (binary, multiclass, ternary, generation) are scored with st
 
 ![Interactive chat](docs/pictures/convo.jpg)
 
-![CLI benchmark run](docs/pictures/CLI.jpg)
-
 ---
 
 ## Install
