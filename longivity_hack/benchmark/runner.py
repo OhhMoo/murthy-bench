@@ -174,51 +174,53 @@ def _problem_content(task: dict) -> str:
     return content
 
 
+def _format_rules_core(format_shape: str, format_lines_count: str, ok_example: str, wrong_extra: str = "") -> str:
+    """Shared format-strict + anti-repetition system-prompt core used by both
+    runners. Keeps the two prompts the same shape and length so models see
+    the same rules whether running shared-budget multi-turn or isolated."""
+    return (
+        f"OUTPUT FORMAT (mandatory) — reply with EXACTLY {format_lines_count}, nothing else:\n"
+        f"\n"
+        f"{format_shape}\n"
+        f"\n"
+        f"min and max are positive numbers with min < max.\n"
+        f"\n"
+        f"Examples that are CORRECT:\n"
+        f"{ok_example}\n"
+        f"\n"
+        f"Examples that are WRONG (never output these shapes):\n"
+        f"  42.0                  ← single number, missing the range\n"
+        f"  The answer is 42.     ← prose / explanation\n"
+        f"  INTERVAL [50, 50]     ← min must be strictly less than max\n"
+        f"  INTERVAL [-3, 10]     ← min must be positive\n"
+        f"{wrong_extra}"
+        f"\n"
+        f"Hard rules:\n"
+        f"- A wide CORRECT interval beats any wrong narrow one.\n"
+        f"- NEVER repeat an interval marked FORBIDDEN. Repetition is the WORST failure mode — the runner will lock the problem after 2 repeats.\n"
+        f"- If a previous attempt was wrong, the answer is OUTSIDE that range. Shift the center OR widen — do NOT keep the same numbers.\n"
+        f"- Output nothing other than the required line(s). No reasoning, no markdown."
+    )
+
+
 def _build_system_prompt(n_problems: int, total_budget: int) -> str:
-    return f"""You are playing Estimathon over {n_problems} problems with {total_budget} total slips.
-
-OUTPUT FORMAT (mandatory) — every reply must be EXACTLY two lines, nothing else:
-
-PROBLEM <n>
-INTERVAL [min, max]
-
-Where <n> is 1..{n_problems} and min < max, both positive numbers.
-
-Examples that are CORRECT:
-  PROBLEM 3
-  INTERVAL [30, 90]
-
-  PROBLEM 12
-  INTERVAL [12.5, 18.0]
-
-Examples that are WRONG (never output these shapes):
-  PROBLEM 3                   ← missing the INTERVAL line
-  42.0                        ← single number, missing the range
-  The answer is 42.           ← prose / explanation
-  INTERVAL [50, 50]           ← min must be strictly less than max
-  INTERVAL [-3, 10]           ← min must be positive
-  PROBLEM 3 INTERVAL [1,2]    ← must be two separate lines
-  ```\nPROBLEM 3\n```         ← no markdown, no code fences
-
-Hard rules — these matter MORE than scoring:
-- NEVER repeat an interval that was already marked BAD for the same problem. Repetition is the WORST failure mode and the runner will lock the problem after 2 repeats.
-- If a previous attempt was BAD, the correct answer is OUTSIDE that range. Shift the center OR widen the range — do NOT keep the same numbers.
-- A wide CORRECT interval (e.g. INTERVAL [1, 100]) is FAR better than a wrong narrow one.
-- Output nothing other than the PROBLEM + INTERVAL lines. No reasoning, no caveats, no markdown.
-
-Game rules:
-- {n_problems} problems, {total_budget} total slips, max {_MAX_SLIPS_PER_PROBLEM} attempts per problem.
-- ONLY your LAST submission for each problem counts.
-- If you refine a GOOD interval and your new one is BAD, you LOSE that problem.
-- Binary feedback only: GOOD or BAD. No directional hints.
-
-Scoring (lower is better):
-  (10 + sum of floor(max/min) for GOOD finals) × 2^({n_problems} − number of GOOD finals)
-
-Strategy:
-  1. Secure GOOD first with a WIDE interval (e.g. INTERVAL [1, 1000]).
-  2. Only narrow when you are confident.
-  3. Spread slips across problems before refining any one."""
+    # Multi-turn shared-budget shape. Same core rules as isolated; only
+    # the format block and a one-line operational note differ.
+    core = _format_rules_core(
+        format_shape="PROBLEM <n>\nINTERVAL [min, max]",
+        format_lines_count="two lines",
+        ok_example=(
+            "  PROBLEM 3\n"
+            "  INTERVAL [30, 90]"
+        ),
+        wrong_extra="  PROBLEM 3 INTERVAL [1,2]   ← must be two separate lines\n",
+    )
+    return (
+        f"{core}\n"
+        f"\n"
+        f"Game: {n_problems} problems, {total_budget} slips, max {_MAX_SLIPS_PER_PROBLEM}/problem. "
+        f"ONLY your LAST submission per problem counts. Binary feedback (GOOD/BAD), no hints."
+    )
 
 
 def _build_standings(session: EstimathonSession) -> str:
@@ -398,35 +400,15 @@ def _isolated_problem_content(task: dict) -> str:
 
 
 def _build_isolated_system_prompt() -> str:
-    # Two simultaneous pressures:
-    #   (1) Format — endpoint models often emit bare numbers ("42") or
-    #       prose. Show contrast examples so "wrong shape" is obvious.
-    #   (2) Anti-repetition — endpoint models with no chat memory will
-    #       happily re-emit the exact same interval. Make repetition a
-    #       named, forbidden failure mode at system level.
-    return (
-        "OUTPUT FORMAT (mandatory) — reply with ONE line, exactly this shape:\n"
-        "\n"
-        "INTERVAL [min, max]\n"
-        "\n"
-        "Where min < max and both are positive numbers.\n"
-        "\n"
-        "Examples that are CORRECT:\n"
-        "  INTERVAL [30, 90]\n"
-        "  INTERVAL [12.5, 18.0]\n"
-        "  INTERVAL [1, 1000]\n"
-        "\n"
-        "Examples that are WRONG (never output these shapes):\n"
-        "  42.0                  ← single number, missing the range\n"
-        "  The answer is 42.     ← prose / explanation\n"
-        "  INTERVAL [50, 50]     ← min must be strictly less than max\n"
-        "  INTERVAL [-3, 10]     ← min must be positive\n"
-        "\n"
-        "Hard rules:\n"
-        "- A wide CORRECT interval (e.g. INTERVAL [1, 100]) beats any wrong narrow one.\n"
-        "- NEVER repeat an interval that the user lists as FORBIDDEN. Repetition is the WORST failure mode.\n"
-        "- If a previous attempt was wrong, the correct answer is OUTSIDE that range. Move the center OR widen the range — do NOT keep the same numbers.\n"
-        "- Output nothing other than the INTERVAL line. No reasoning, no caveats, no markdown."
+    # Single-turn shape. Same shared core as the legacy multi-turn prompt —
+    # only the format block differs (one line instead of two).
+    return _format_rules_core(
+        format_shape="INTERVAL [min, max]",
+        format_lines_count="ONE line",
+        ok_example=(
+            "  INTERVAL [30, 90]\n"
+            "  INTERVAL [12.5, 18.0]"
+        ),
     )
 
 
